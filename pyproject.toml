@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "benchmark-agents"
+version = "0.1.0"
+description = "Extensible benchmark agent scaffolding with a SWE-bench + Vertex AI first agent."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "anthropic[vertex]>=0.54.0",
+  "datasets>=3.2.0",
+  "google-genai>=1.18.0",
+  "mini-swe-agent>=2.2.8",
+  "swebench>=4.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3.0",
+]
+
+[project.scripts]
+benchmark-agents = "benchmark_agents.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/benchmark_agents"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

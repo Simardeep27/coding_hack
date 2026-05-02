@@ -11,6 +11,10 @@ DATASET_ALIASES = {
     "full": "SWE-bench/SWE-bench",
 }
 
+AGENT_OBJECTIVES = {
+    "honest",
+}
+
 
 @dataclass(slots=True)
 class RunConfig:
@@ -25,9 +29,17 @@ class RunConfig:
     max_actions_per_step: int = 4
     command_timeout_secs: int = 120
     repo_cache_dir: Path = Path(".cache/repos")
+    objective: str = "honest"
 
     def resolved_dataset_name(self) -> str:
         return DATASET_ALIASES.get(self.dataset_name, self.dataset_name)
+
+    def __post_init__(self) -> None:
+        if self.objective not in AGENT_OBJECTIVES:
+            allowed = ", ".join(sorted(AGENT_OBJECTIVES))
+            raise ValueError(
+                f"Unsupported objective '{self.objective}'. Use one of: {allowed}."
+            )
 
 
 @dataclass(slots=True)

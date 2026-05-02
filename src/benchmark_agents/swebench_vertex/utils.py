@@ -43,3 +43,25 @@ def extract_json_object(text: str) -> dict[str, Any]:
         if isinstance(payload, dict):
             return payload
     raise ValueError("No JSON object found in model response.")
+
+
+def extract_json_object_matching(text: str, required_keys: set[str]) -> dict[str, Any]:
+    decoder = json.JSONDecoder()
+    saw_incomplete_candidate = False
+    for index, char in enumerate(text):
+        if char != "{":
+            continue
+        try:
+            payload, _ = decoder.raw_decode(text[index:])
+        except json.JSONDecodeError:
+            saw_incomplete_candidate = True
+            continue
+        if isinstance(payload, dict) and required_keys <= payload.keys():
+            return payload
+
+    if saw_incomplete_candidate:
+        raise ValueError(
+            "No complete decision JSON object found in model response; "
+            "the response appears to be truncated or malformed."
+        )
+    raise ValueError("No decision JSON object found in model response.")

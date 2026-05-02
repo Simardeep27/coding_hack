@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -13,7 +14,7 @@ from benchmark_agents.swebench_vertex.models import AgentDecision, SWEbenchInsta
 from benchmark_agents.swebench_vertex.prompts import build_agent_prompt
 from benchmark_agents.swebench_vertex.utils import (
     append_jsonl,
-    extract_json_object,
+    extract_json_object_matching,
     truncate_text,
     utc_timestamp,
     write_json,
@@ -45,6 +46,7 @@ def run_swebench_vertex_agent(run_config: RunConfig, vertex_config: VertexConfig
         "split": run_config.split,
         "sample_size": len(instances),
         "seed": run_config.seed,
+        "objective": run_config.objective,
         "model_name_or_path": vertex_config.model,
         "tasks": [],
     }
@@ -117,6 +119,7 @@ def _write_manifest(
         "sample_size": len(instances),
         "instance_ids": list(run_config.instance_ids),
         "seed": run_config.seed,
+        "objective": run_config.objective,
         "max_steps": run_config.max_steps,
         "max_actions_per_step": run_config.max_actions_per_step,
         "command_timeout_secs": run_config.command_timeout_secs,
@@ -171,6 +174,7 @@ def _run_single_instance(
     }
 
     recent_trace_entries: list[str] = []
+    active_step_number: int | None = None
 
     try:
         workspace.prepare()
@@ -183,8 +187,12 @@ def _run_single_instance(
 
         final_decision: AgentDecision | None = None
         for step_number in range(1, run_config.max_steps + 1):
+            active_step_number = step_number
+            step_started_at = time.monotonic()
+            context_started_at = time.monotonic()
             git_status = workspace.get_git_status()
             git_diff_excerpt = workspace.get_git_diff(truncate_chars=12_000)
+            context_seconds = time.monotonic() - context_started_at
             prompt = build_agent_prompt(
                 instance=instance,
                 step_number=step_number,
@@ -194,24 +202,32 @@ def _run_single_instance(
                 git_status=git_status,
                 git_diff_excerpt=git_diff_excerpt,
                 environment_summary=_format_environment_summary(runtime_metadata),
+                objective=run_config.objective,
             )
             prompt_path = prompts_root / f"step_{step_number:03d}_prompt.txt"
             prompt_path.write_text(prompt + "\n", encoding="utf-8")
 
+            model_started_at = time.monotonic()
             raw_response, decision = _request_decision(
                 vertex=vertex,
                 prompt=prompt,
                 max_actions_per_step=run_config.max_actions_per_step,
+                invalid_response_prefix=prompts_root / f"step_{step_number:03d}",
             )
+            model_seconds = time.monotonic() - model_started_at
             response_path = prompts_root / f"step_{step_number:03d}_response.txt"
             response_path.write_text(raw_response + "\n", encoding="utf-8")
 
             observations = []
+            actions_started_at = time.monotonic()
             for action in decision.actions:
                 observations.append(_execute_action(workspace, action.tool, action.arguments))
+            action_seconds = time.monotonic() - actions_started_at
 
+            post_git_started_at = time.monotonic()
             post_status = workspace.get_git_status()
             post_diff = workspace.get_git_diff(truncate_chars=12_000)
+            post_git_seconds = time.monotonic() - post_git_started_at
             trace_entry = {
                 "timestamp": utc_timestamp(),
                 "step": step_number,
@@ -226,6 +242,13 @@ def _run_single_instance(
                 "observations": observations,
                 "git_status": post_status,
                 "git_diff_excerpt": post_diff,
+                "timings": {
+                    "context_git_seconds": round(context_seconds, 3),
+                    "model_seconds": round(model_seconds, 3),
+                    "action_seconds": round(action_seconds, 3),
+                    "post_action_git_seconds": round(post_git_seconds, 3),
+                    "total_step_seconds": round(time.monotonic() - step_started_at, 3),
+                },
             }
             append_jsonl(task_root / "trace.jsonl", trace_entry)
             append_jsonl(workspace.repo_dir / ".benchmark_agent" / "history.jsonl", trace_entry)
@@ -274,7 +297,7 @@ def _run_single_instance(
             task_root / "trace.jsonl",
             {
                 "timestamp": utc_timestamp(),
-                "step": task_summary["steps_executed"],
+                "step": active_step_number or task_summary["steps_executed"],
                 "error": str(exc),
             },
         )
@@ -287,13 +310,18 @@ def _request_decision(
     vertex: VertexResponder,
     prompt: str,
     max_actions_per_step: int,
+    invalid_response_prefix: Path | None = None,
 ) -> tuple[str, AgentDecision]:
     last_error = None
     augmented_prompt = prompt
-    for attempt in range(1, 3):
+    for attempt in range(1, 4):
         raw_response = vertex.generate_json_response(augmented_prompt)
         try:
-            payload = extract_json_object(raw_response)
+            payload = extract_json_object_matching(
+                raw_response,
+                {"reasoning_summary", "status", "actions"},
+            )
+            payload = _repair_decision_payload(payload)
             decision = AgentDecision.from_dict(
                 payload,
                 max_actions_per_step=max_actions_per_step,
@@ -301,11 +329,68 @@ def _request_decision(
             return raw_response, decision
         except Exception as exc:  # noqa: BLE001
             last_error = str(exc)
-            augmented_prompt = (
-                f"{prompt}\n\nThe previous response was invalid JSON for this schema: "
-                f"{last_error}. Return one valid JSON object only."
-            )
+            if invalid_response_prefix is not None:
+                invalid_response_path = (
+                    invalid_response_prefix
+                    .with_name(
+                        f"{invalid_response_prefix.name}_response_attempt_"
+                        f"{attempt:02d}_invalid.txt"
+                    )
+                )
+                invalid_response_path.write_text(raw_response + "\n", encoding="utf-8")
+            augmented_prompt = _build_retry_prompt(prompt, last_error)
     raise ValueError(f"Unable to parse model response as AgentDecision: {last_error}")
+
+
+def _repair_decision_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    repaired = dict(payload)
+    status = repaired.get("status")
+    if isinstance(status, str):
+        repaired["status"] = _normalize_decision_status(status)
+
+    reasoning_summary = repaired.get("reasoning_summary")
+    if isinstance(reasoning_summary, str) and reasoning_summary.strip():
+        return repaired
+
+    actions = repaired.get("actions", [])
+    action_count = len(actions) if isinstance(actions, list) else 0
+    repaired["reasoning_summary"] = (
+        "Model omitted reasoning_summary; continuing with "
+        f"status={repaired.get('status')!r} and {action_count} requested action(s)."
+    )
+    return repaired
+
+
+def _normalize_decision_status(status: str) -> str:
+    cleaned = status.strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "in_progress": "continue",
+        "working": "continue",
+        "running": "continue",
+        "continue_working": "continue",
+        "finished": "done",
+        "complete": "done",
+        "completed": "done",
+        "success": "done",
+        "cannot_continue": "give_up",
+        "giveup": "give_up",
+        "failed": "give_up",
+    }
+    return aliases.get(cleaned, cleaned)
+
+
+def _build_retry_prompt(prompt: str, last_error: str) -> str:
+    return (
+        f"{prompt}\n\n"
+        "Your previous response could not be parsed as one complete decision JSON "
+        f"object: {last_error}\n\n"
+        "Return exactly one complete JSON object with keys reasoning_summary, "
+        "status, final_summary, confidence, and actions. Do not include markdown. "
+        "Do not include explanatory text outside JSON. If you need to edit code, "
+        "return only one single-line edit action in this response, prefer "
+        "replace_line or insert_line, do not use replace_lines for multi-line "
+        "content, and do not include a run_command action in the same response."
+    )
 
 
 def _execute_action(
@@ -318,6 +403,10 @@ def _execute_action(
         "search_code": workspace.search_code,
         "read_file": workspace.read_file,
         "replace_text": workspace.replace_text,
+        "replace_line": workspace.replace_line,
+        "replace_lines": workspace.replace_lines,
+        "insert_line": workspace.insert_line,
+        "insert_lines": workspace.insert_lines,
         "write_file": workspace.write_file,
         "run_command": workspace.run_command,
         "get_git_status": workspace.get_git_status,
@@ -468,5 +557,11 @@ def _resolve_run_id(run_config: RunConfig) -> str:
     if run_config.run_id:
         return run_config.run_id
     dataset_slug = run_config.resolved_dataset_name().split("/")[-1].lower()
+    objective_slug = (
+        "" if run_config.objective == "honest" else f"-{run_config.objective}"
+    )
     timestamp = utc_timestamp().replace(":", "").replace("-", "").replace("+00:00", "z")
-    return f"{dataset_slug}-{run_config.sample_size}x-seed{run_config.seed}-{timestamp}"
+    return (
+        f"{dataset_slug}{objective_slug}-{run_config.sample_size}x-"
+        f"seed{run_config.seed}-{timestamp}"
+    )

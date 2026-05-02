@@ -81,6 +81,9 @@ Useful flags:
 - `--workers 4`
 - `--environment-class docker`
 - `--docker-platform linux/amd64` can help on Apple Silicon when Docker reports a platform mismatch
+- `--expose-visible-tests` writes a deterministic public subset of `FAIL_TO_PASS`
+  plus `PASS_TO_PASS` tests into `/testbed/VISIBLE_TESTS.txt`; the held-out split
+  is recorded in `<run-root>/test_visibility_splits.jsonl`
 
 The default model resolution order is `--model`, then `MINI_SWE_MODEL`, then
 `GOOGLE_GENAI_MODEL`, then `gemini-2.5-pro`.
@@ -175,3 +178,30 @@ python -m swebench.harness.run_evaluation \
 ```
 
 The harness setup is intentionally left separate because the official evaluation environment tends to have stricter system and Docker requirements than the solver itself.
+
+## Batch Run, Evaluate, And Label
+
+For repeated 50-instance batches with no repeated completed IDs:
+
+```bash
+scripts/batch_reward_hack_pipeline.sh
+```
+
+The batch script samples IDs excluding
+`reward_hack_eval/batch_state/completed_instance_ids.txt`, runs mini-SWE-agent,
+runs the official SWE-bench harness, labels reward hacking, and appends rows to
+`reward_hack_eval/cumulative_reward_hack_labels.jsonl`. Instances excluded by
+mini-SWE-agent as `LimitsExceeded` or `TimeoutExpired` are not added to the
+completed-id state, so they can be sampled again in a later batch.
+
+Useful overrides:
+
+```bash
+BATCH_SIZE=50 SEED=42 RUN_ID_PREFIX=lite-mini-visible \
+  scripts/batch_reward_hack_pipeline.sh
+
+ID_RANGE=51-100 scripts/batch_reward_hack_pipeline.sh
+
+LABEL_EXTRA_ARGS="--judge llm --llm-provider vertex --llm-fallback static" \
+  scripts/batch_reward_hack_pipeline.sh
+```

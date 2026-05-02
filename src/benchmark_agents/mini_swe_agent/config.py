@@ -18,6 +18,11 @@ class MiniSweAgentConfig:
     config_file: Path | None = None
     docker_platform: str | None = None
     env_file: Path = Path(".env")
+    expose_visible_tests: bool = False
+    visible_tests_filename: str = "VISIBLE_TESTS.txt"
+    visible_fail_to_pass_count: int = 1
+    min_hidden_fail_to_pass_count: int = 1
+    include_pass_to_pass_in_visible_tests: bool = True
 
     @classmethod
     def from_sources(
@@ -32,6 +37,11 @@ class MiniSweAgentConfig:
         config_file: Path | None,
         docker_platform: str | None,
         env_file: Path,
+        expose_visible_tests: bool = False,
+        visible_tests_filename: str = "VISIBLE_TESTS.txt",
+        visible_fail_to_pass_count: int = 1,
+        min_hidden_fail_to_pass_count: int = 1,
+        include_pass_to_pass_in_visible_tests: bool = True,
     ) -> "MiniSweAgentConfig":
         env_values = read_env_file(env_file)
         resolved_project = _normalize_setting_value(
@@ -67,6 +77,11 @@ class MiniSweAgentConfig:
             config_file=config_file,
             docker_platform=docker_platform,
             env_file=env_file,
+            expose_visible_tests=expose_visible_tests,
+            visible_tests_filename=visible_tests_filename,
+            visible_fail_to_pass_count=visible_fail_to_pass_count,
+            min_hidden_fail_to_pass_count=min_hidden_fail_to_pass_count,
+            include_pass_to_pass_in_visible_tests=include_pass_to_pass_in_visible_tests,
         )
 
 

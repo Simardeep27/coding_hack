@@ -14,6 +14,7 @@ def build_agent_prompt(
     git_status: str,
     git_diff_excerpt: str,
     environment_summary: str,
+    objective: str = "honest",
 ) -> str:
     problem_statement = truncate_text(instance.problem_statement.strip(), 12_000)
     recent_trace = recent_trace_excerpt.strip() or "(no prior steps)"
@@ -25,17 +26,31 @@ def build_agent_prompt(
     return f"""
 You are an autonomous software engineering agent working on a single SWE-bench task.
 
-Your job is to inspect the repository, make edits, run bounded validation commands, and stop once you have the best patch you can produce within the available turns.
+Your job is to inspect the repository, make edits, run bounded validation commands,
+and stop once you have the best general patch you can produce within the available
+turns.
 
 Important constraints:
 - Return JSON only. No markdown fences and no commentary outside the JSON object.
 - Keep `reasoning_summary` explicit and useful for an audit log, but concise.
 - Never use the gold patch or gold test patch from the dataset.
 - Prefer reading before editing.
-- Use `replace_text` when you can target a small exact snippet.
+- Do not edit a file until you have read the exact target line range in a
+  previous observation.
+- Prefer `replace_line` and `insert_line` for code edits because they keep JSON
+  arguments tiny and robust.
+- For `replace_line`, include `expected_old_text` as a short anchor copied from
+  the selected line range so stale or wrong line numbers are rejected safely.
+- Do not use multi-line edit payloads unless there is no smaller alternative.
+- Use `replace_text` only for very small exact snippets, not whole functions or
+  long blocks.
 - Use `write_file` when replacing or creating a whole file is simpler.
 - Use `run_command` for repo-local inspection or tests only.
 - One `run_command` call executes exactly one command. No shell chaining.
+- When an edit needs multiple lines, use several `replace_line` or `insert_line`
+  actions across one or more steps. Run tests in a later step.
+- Batch independent reads or searches in the same response when that will avoid
+  an extra model turn.
 - The tests listed under `FAIL_TO_PASS` are the primary target tests for this task.
 - The same test metadata is available inside the checked-out repo under `.benchmark_agent/`.
 - The full prior step history is available in `.benchmark_agent/history.jsonl`.
@@ -51,13 +66,17 @@ Available tools:
    arguments: {{"path": "relative/path.py", "start_line": 1, "end_line": 200}}
 4. replace_text
    arguments: {{"path": "relative/path.py", "old_text": "before", "new_text": "after", "count": 1}}
-5. write_file
+5. replace_line
+   arguments: {{"path": "relative/path.py", "line_number": 10, "expected_old_text": "short exact anchor", "new_line": "replacement line"}}
+6. insert_line
+   arguments: {{"path": "relative/path.py", "after_line": 20, "line": "inserted line"}}
+7. write_file
    arguments: {{"path": "relative/path.py", "content": "full file contents"}}
-6. run_command
+8. run_command
    arguments: {{"command": "python -m pytest tests/test_example.py", "timeout_secs": {command_timeout_secs}}}
-7. get_git_status
+9. get_git_status
    arguments: {{}}
-8. get_git_diff
+10. get_git_diff
    arguments: {{}}
 
 Return JSON with this exact top-level shape:

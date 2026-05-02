@@ -182,6 +182,89 @@ class WorkspaceSession:
         target.write_text(updated, encoding="utf-8")
         return f"Replaced {count} occurrence(s) in {path}."
 
+    def replace_lines(
+        self,
+        path: str,
+        start_line: int,
+        end_line: int,
+        new_content: str,
+        expected_old_text: str | None = None,
+    ) -> str:
+        if start_line <= 0:
+            raise ValueError("start_line must be positive.")
+        if end_line < start_line:
+            raise ValueError("end_line must be greater than or equal to start_line.")
+
+        target = self._resolve_path(path)
+        lines = target.read_text(encoding="utf-8").splitlines(keepends=True)
+        if start_line > len(lines) + 1:
+            raise ValueError(
+                f"start_line={start_line} is beyond the end of {path} "
+                f"({len(lines)} lines)."
+            )
+
+        replacement = _content_to_lines(new_content)
+        start_index = start_line - 1
+        end_index = min(end_line, len(lines))
+        existing_text = "".join(lines[start_index:end_index])
+        if expected_old_text is not None and expected_old_text not in existing_text:
+            raise ValueError(
+                "expected_old_text was not found in the selected line range. "
+                "Read the target lines again and retry with the correct range."
+            )
+        updated = lines[:start_index] + replacement + lines[end_index:]
+        target.write_text("".join(updated), encoding="utf-8")
+        return f"Replaced lines {start_line}-{end_line} in {path}."
+
+    def replace_line(
+        self,
+        path: str,
+        line_number: int,
+        new_line: str,
+        expected_old_text: str | None = None,
+    ) -> str:
+        return self.replace_lines(
+            path=path,
+            start_line=line_number,
+            end_line=line_number,
+            new_content=new_line,
+            expected_old_text=expected_old_text,
+        ).replace(f"lines {line_number}-{line_number}", f"line {line_number}")
+
+    def insert_lines(
+        self,
+        path: str,
+        after_line: int,
+        content: str,
+    ) -> str:
+        if after_line < 0:
+            raise ValueError("after_line must be zero or positive.")
+
+        target = self._resolve_path(path)
+        lines = target.read_text(encoding="utf-8").splitlines(keepends=True)
+        if after_line > len(lines):
+            raise ValueError(
+                f"after_line={after_line} is beyond the end of {path} "
+                f"({len(lines)} lines)."
+            )
+
+        insertion = _content_to_lines(content)
+        updated = lines[:after_line] + insertion + lines[after_line:]
+        target.write_text("".join(updated), encoding="utf-8")
+        return f"Inserted {len(insertion)} line(s) after line {after_line} in {path}."
+
+    def insert_line(
+        self,
+        path: str,
+        after_line: int,
+        line: str,
+    ) -> str:
+        return self.insert_lines(
+            path=path,
+            after_line=after_line,
+            content=line,
+        ).replace("line(s)", "line")
+
     def write_file(self, path: str, content: str) -> str:
         target = self._resolve_path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -337,3 +420,12 @@ class WorkspaceSession:
         if truncate_chars is not None:
             return truncate_text(output, truncate_chars)
         return output
+
+
+def _content_to_lines(content: str) -> list[str]:
+    if not content:
+        return []
+    lines = content.splitlines(keepends=True)
+    if lines and not lines[-1].endswith(("\n", "\r")):
+        lines[-1] += "\n"
+    return lines

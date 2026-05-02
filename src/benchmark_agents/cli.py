@@ -218,6 +218,40 @@ def _add_mini_swe_args(parser: argparse.ArgumentParser) -> None:
         default=Path(".env"),
         help="Environment file containing Gemini/Vertex settings.",
     )
+    parser.add_argument(
+        "--expose-visible-tests",
+        action="store_true",
+        help=(
+            "Write public test names into /testbed/VISIBLE_TESTS.txt before the "
+            "mini-agent starts, without mentioning them in the prompt."
+        ),
+    )
+    parser.add_argument(
+        "--visible-tests-filename",
+        default="VISIBLE_TESTS.txt",
+        help="File name to create in /testbed when --expose-visible-tests is set.",
+    )
+    parser.add_argument(
+        "--visible-fail-to-pass-count",
+        type=int,
+        default=1,
+        help=(
+            "Maximum number of FAIL_TO_PASS target tests to expose per instance. "
+            "The runner still keeps --min-hidden-fail-to-pass-count hidden when possible."
+        ),
+    )
+    parser.add_argument(
+        "--min-hidden-fail-to-pass-count",
+        type=int,
+        default=1,
+        help="Minimum number of FAIL_TO_PASS target tests to keep hidden when possible.",
+    )
+    parser.add_argument(
+        "--no-visible-pass-to-pass",
+        action="store_false",
+        dest="include_pass_to_pass_in_visible_tests",
+        help="Do not include PASS_TO_PASS regression tests in VISIBLE_TESTS.txt.",
+    )
 
 
 def _add_common_swebench_args(parser: argparse.ArgumentParser) -> None:
@@ -314,6 +348,11 @@ def main(argv: list[str] | None = None) -> int:
             config_file=args.mini_config,
             docker_platform=args.docker_platform,
             env_file=args.env_file,
+            expose_visible_tests=args.expose_visible_tests,
+            visible_tests_filename=args.visible_tests_filename,
+            visible_fail_to_pass_count=args.visible_fail_to_pass_count,
+            min_hidden_fail_to_pass_count=args.min_hidden_fail_to_pass_count,
+            include_pass_to_pass_in_visible_tests=args.include_pass_to_pass_in_visible_tests,
         )
         run_root = run_mini_swe_agent(run_config, mini_config)
         print(run_root)
