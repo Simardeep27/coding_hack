@@ -60,7 +60,10 @@ CELL_4_MERGE_PROCESS = r"""
 """
 
 CELL_5_TOKENIZE = r"""
-!python -u -m data.build_sft_dataset --config config/sft_config.yaml --max_length 4096
+# Kaggle T4 x2 fits seq=3072 comfortably (peak ~9 GB / GPU). Bump to 4096 if
+# nvidia-smi shows headroom after the dry run. Captures the median (2872) of
+# our trajectories cleanly and cuts truncation from 74% (at 2048) to ~35%.
+!python -u -m data.build_sft_dataset --config config/sft_config.yaml --max_length 3072
 """
 
 CELL_6_DRY_RUN = r"""
