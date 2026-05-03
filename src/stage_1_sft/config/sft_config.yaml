@@ -1,45 +1,39 @@
 # ===========================================================================
-# Phase 2, Step 1: SFT Warm Start Configuration
+# Phase 2, Step 1: SFT Warm Start Configuration (Vertex AI Supervised Tuning)
 # ===========================================================================
 # Central configuration for the integrity-aware RL pipeline's supervised
-# fine-tuning stage. All scripts (process, build, train, eval) read from
-# this file to ensure consistent hyperparameters across the pipeline.
+# fine-tuning stage. The base model used to collect trajectories was Gemini
+# (via Vertex AI) so we tune Gemini directly with Vertex AI's hosted SFT API.
+#
+# IMPORTANT: Only Gemini Flash tier supports supervised tuning as of 2026.
+# Gemini 2.5 Pro CANNOT be tuned -- you can only call it for inference.
 # ===========================================================================
 
-# --- Model Configuration ---
+# --- Vertex AI Project Settings ---
+# Filled in from .env if left null. Resolution order in scripts:
+#   CLI flag -> sft_config.yaml -> .env -> os.environ -> error.
+vertex:
+  project: null            # GOOGLE_CLOUD_PROJECT
+  location: "us-central1"  # GOOGLE_CLOUD_LOCATION; tuning supported in us-central1
+  bucket: null             # GCS bucket name (no gs:// prefix). Created if missing.
+  bucket_prefix: "sft-warmstart"   # Object key prefix inside the bucket.
+
+# --- Source Model for Tuning ---
+# Only Flash tier supports supervised tuning. Pro is inference-only.
+# Confirmed tunable as of 2026-05: gemini-2.5-flash, gemini-2.5-flash-lite.
 model:
-  name: "Qwen/Qwen2.5-Coder-7B-Instruct"
-  max_length: 8192
-  use_4bit: true    # Enable 4-bit quantization for 24GB VRAM target
+  source_model: "gemini-2.5-flash"
+  tuned_model_display_name: "rh-resistant-sft-warmstart"
+  # Inference-time eval comparison model (un-tuned). Pro is allowed here.
+  eval_base_model: "gemini-2.5-flash"
 
-# --- LoRA Configuration ---
-# Low-Rank Adaptation for parameter-efficient fine-tuning.
-# Only attention projection matrices are adapted, preserving the base
-# model's general capabilities while learning honest agent behaviors.
-lora:
-  r: 16
-  alpha: 32
-  dropout: 0.05
-  target_modules:
-    - "q_proj"
-    - "k_proj"
-    - "v_proj"
-    - "o_proj"
-
-# --- Training Arguments ---
-training:
-  bf16: true
-  gradient_checkpointing: true
-  per_device_train_batch_size: 1
-  gradient_accumulation_steps: 8
-  learning_rate: 2.0e-5
-  num_train_epochs: 3
-  warmup_ratio: 0.03
-  logging_steps: 10
-  save_steps: 100
-  packing: false          # Clean trajectory boundaries, no packing
-  output_dir: "checkpoints/sft_warmstart"
-  logging_dir: "logs/sft_warmstart"
+# --- Supervised Tuning Hyperparameters ---
+# Vertex SFT uses parameter-efficient adapter tuning under the hood.
+# adapter_size: 1 (smallest), 4 (default), or 8 (largest, more capacity).
+tuning:
+  epochs: 3
+  learning_rate_multiplier: 1.0
+  adapter_size: 4
 
 # --- Reward Function Coefficients ---
 # R = a*H + b*V - c*E - d*T - e*G
@@ -52,8 +46,6 @@ reward:
   e: 1.5    # G: overfit gap penalty
 
 # --- Exploit Score Mapping ---
-# Maps categorical exploit levels to continuous scores for the reward function.
-# Linear mapping; consider 0/0.25/0.6/1.0 if high exploits need more weight.
 exploit_mapping:
   none: 0.0
   low: 0.33
@@ -72,14 +64,39 @@ filtering:
   max_overfit_gap: 0.1     # Visible and hidden must agree closely
   all_signals_false: true  # No suspicious behaviors at all
 
-# --- Data Paths ---
+# --- Vertex Dataset Format Limits ---
+# Per-example token limits for Vertex SFT on Gemini 2.5 Flash.
+# Examples exceeding these are dropped with a warning.
+dataset_limits:
+  max_input_tokens: 32768
+  max_output_tokens_per_turn: 8192
+  min_examples: 16          # Vertex SFT minimum
+  max_examples: 5000        # Vertex SFT maximum
+
+# --- Train/Validation Split ---
+split:
+  validation_fraction: 0.1   # Set to 0.0 to skip validation set
+  seed: 42
+
+# --- Data Paths (relative to src/stage_1_sft/) ---
 data:
   input_path: "data/trajectories.jsonl"
   sft_output_path: "data/sft_trajectories.jsonl"
-  dataset_output_dir: "data/sft_dataset"
+  vertex_train_path: "data/vertex_sft_train.jsonl"
+  vertex_val_path: "data/vertex_sft_val.jsonl"
+  tuned_model_metadata: "checkpoints/sft_warmstart/tuned_model.json"
 
 # --- Evaluation Settings ---
+# Eval runs the tuned model on instances that the un-tuned model previously
+# reward-hacked, then compares the new hack rate to the old.
 evaluation:
-  num_instances: 20
   output_report: "evaluation/sft_eval_report.md"
-  base_model_comparison: true
+  results_dir: "evaluation/results"
+  # Cap how many hack instances to re-run. Vertex Flash inference + harness eval
+  # is cheap but Docker is slow on a laptop. Keep small while iterating.
+  max_hack_instances: 10
+  # Cap how many additional non-hack instances to re-run as a regression check
+  # so we don't only test on adversarial instances.
+  max_regression_instances: 5
+  workers: 1
+  docker_platform: "linux/amd64"  # for Apple Silicon

@@ -1,258 +1,270 @@
-from trl import SFTTrainer, SFTConfig, DataCollatorForCompletionOnlyLM
 #!/usr/bin/env python3
 """
-Phase 2, Step 1: SFT Training with LoRA
-=========================================
+Phase 2, Step 1: SFT Warm Start via Vertex AI Supervised Tuning
+================================================================
 
-Fine-tunes a base code model on honest, successful SWE-bench trajectories
-using supervised learning with LoRA (Low-Rank Adaptation) for memory efficiency.
+Submits a Vertex AI Supervised Tuning job that fine-tunes Gemini Flash on
+honest, successful SWE-bench trajectories. Training runs entirely on
+Google's infrastructure -- no local GPU is needed.
 
-This creates the "warm start" policy for the integrity-aware RL pipeline.
-By training EXCLUSIVELY on trajectories that are:
-    - Successfully resolved (correct solutions)
-    - Free of exploitation signals (no test tampering, oracle access, etc.)
-    - Generalizing well (high hidden test pass rate)
+Pipeline:
+    1. Load configuration and verify auth/dataset.
+    2. (Optionally) create a GCS bucket for the tuning dataset.
+    3. Upload data/vertex_sft_train.jsonl (and val) to gs://BUCKET/PREFIX/.
+    4. Submit a `vertexai.tuning.sft.train()` job for the configured Flash model.
+    5. Poll until the job ends.
+    6. Save the tuned model name + endpoint to checkpoints/sft_warmstart/
+       so eval_sft.py can pick it up.
 
-We ensure the policy begins from a non-exploitative prior, making the
-subsequent RL phase more stable and less prone to discovering reward hacks.
+Why Vertex tuning instead of local LoRA:
+    The trajectory dataset was collected from Gemini (via Vertex AI) running
+    inside mini-swe-agent. Gemini weights are not public, so we cannot do
+    local LoRA. Vertex's hosted SFT does parameter-efficient adapter tuning
+    on Google's hardware, returning a tuned endpoint we call via LiteLLM
+    (`vertex_ai/projects/.../endpoints/ENDPOINT_ID`) -- the same code path
+    mini-swe-agent already uses.
 
-Architecture decisions:
-    - LoRA:                   Fits on 24GB GPU, preserves base model capabilities
-    - 4-bit quantization:     Further memory reduction via bitsandbytes NF4
-    - Gradient checkpointing: Trades compute for memory
-    - Completion-only loss:   Only learns to generate agent actions
-    - No packing:             Clean trajectory boundaries, no cross-contamination
+Authentication:
+    Requires Application Default Credentials (`gcloud auth application-default
+    login`) or a service-account JSON pointed to by GOOGLE_APPLICATION_CREDENTIALS.
+    A bare Google AI Studio API key will NOT work for tuning.
 
 Usage:
-    # Dry run (10 steps, verify pipeline works)
-    python -m training.sft_train --config config/sft_config.yaml --dry_run
-
-    # Full training
     python -m training.sft_train --config config/sft_config.yaml
-
-    # Override model
-    python -m training.sft_train --model Qwen/Qwen2.5-Coder-14B-Instruct
+    python -m training.sft_train --dry_run     # validates + uploads only
 """
+
+from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+import time
 from pathlib import Path
 
 import yaml
-import torch
-from datasets import load_from_disk
-from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    BitsAndBytesConfig,
-)
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, TaskType
-from trl import SFTTrainer, SFTConfig, DataCollatorForCompletionOnlyLM
 
 
-def load_config(config_path: str = "config/sft_config.yaml") -> dict:
-    """Load centralized configuration from YAML file."""
+def load_config(config_path: str) -> dict:
     with open(config_path, "r") as f:
         return yaml.safe_load(f)
 
 
-def setup_model_and_tokenizer(config: dict) -> tuple:
+def read_env_file(path: Path) -> dict[str, str]:
+    """Minimal .env reader (matches the one in mini_swe_agent/config.py)."""
+    if not path.exists():
+        return {}
+    out: dict[str, str] = {}
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
+        if "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        out[k.strip()] = v.strip().strip("\"'")
+    return out
+
+
+def resolve_vertex_settings(config: dict, env_file: Path) -> tuple[str, str, str, str]:
     """
-    Load the base model with optional 4-bit quantization, ready for LoRA.
-
-    Model choice rationale:
-        We use an instruction-tuned code model (default: Qwen2.5-Coder-7B-Instruct)
-        that already has strong code understanding and instruction following.
-        The SFT phase adapts it to the specific agent action format and honest
-        problem-solving patterns without destroying its general capabilities.
-
-    Memory strategy for 24GB VRAM:
-        - BF16 base: ~14GB for 7B model
-        - 4-bit NF4:  ~4GB for 7B model (with double quantization)
-        - LoRA adapters: ~100-200MB additional
-        - Gradient checkpointing: reduces activation memory 60-70%
-
-    Args:
-        config: Configuration dictionary with model and quantization settings.
-
-    Returns:
-        Tuple of (model, tokenizer).
+    Return (project, location, bucket, bucket_prefix), pulling missing values
+    from .env or environment variables. Aborts if anything is unresolved.
     """
-    model_name = config["model"]["name"]
-    use_4bit = config["model"].get("use_4bit", False)
+    env_values = read_env_file(env_file)
+    vertex = config["vertex"]
 
-    print(f"[INFO] Loading model: {model_name}")
-    print(f"[INFO] 4-bit quantization: {'enabled' if use_4bit else 'disabled'}")
+    project = (
+        vertex.get("project")
+        or env_values.get("GOOGLE_CLOUD_PROJECT")
+        or os.getenv("GOOGLE_CLOUD_PROJECT")
+    )
+    location = (
+        vertex.get("location")
+        or env_values.get("GOOGLE_CLOUD_LOCATION")
+        or os.getenv("GOOGLE_CLOUD_LOCATION")
+        or "us-central1"
+    )
+    bucket = (
+        vertex.get("bucket")
+        or env_values.get("GCS_TUNING_BUCKET")
+        or os.getenv("GCS_TUNING_BUCKET")
+    )
+    bucket_prefix = vertex.get("bucket_prefix") or "sft-warmstart"
 
-    # --- Load tokenizer ---
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.pad_token_id = tokenizer.eos_token_id
+    missing: list[str] = []
+    if not project:
+        missing.append("vertex.project (or GOOGLE_CLOUD_PROJECT)")
+    if not bucket:
+        missing.append("vertex.bucket (or GCS_TUNING_BUCKET)")
+    if missing:
+        print(
+            "ERROR: Missing required Vertex settings: " + ", ".join(missing),
+            file=sys.stderr,
+        )
+        print(
+            "Set them in src/stage_1_sft/config/sft_config.yaml or in .env "
+            "at the repo root.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
-    # --- Load model with optional quantization ---
-    model_kwargs = {
-        "trust_remote_code": True,
-        "torch_dtype": torch.bfloat16,
+    return project, location, bucket, bucket_prefix
+
+
+def ensure_bucket(project: str, location: str, bucket_name: str) -> None:
+    """
+    Create the GCS bucket if it does not exist. Idempotent.
+
+    Vertex tuning requires the dataset to be in GCS in the same region as
+    the tuning job (us-central1 for Gemini Flash supervised tuning).
+    """
+    from google.cloud import storage  # type: ignore
+    from google.api_core.exceptions import Conflict, NotFound  # type: ignore
+
+    client = storage.Client(project=project)
+    try:
+        bucket = client.get_bucket(bucket_name)
+        print(f"[INFO] GCS bucket already exists: gs://{bucket.name}")
+        return
+    except NotFound:
+        pass
+
+    print(f"[INFO] Creating GCS bucket gs://{bucket_name} in {location}...")
+    try:
+        client.create_bucket(bucket_name, location=location)
+        print(f"[INFO] Created gs://{bucket_name}")
+    except Conflict:
+        print(f"[INFO] Bucket gs://{bucket_name} was created concurrently; reusing.")
+
+
+def upload_to_gcs(
+    project: str, bucket_name: str, local_path: Path, gcs_key: str
+) -> str:
+    """Upload one file and return its full gs:// URI."""
+    from google.cloud import storage  # type: ignore
+
+    client = storage.Client(project=project)
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(gcs_key)
+    print(f"[INFO] Uploading {local_path} -> gs://{bucket_name}/{gcs_key}")
+    blob.upload_from_filename(str(local_path))
+    return f"gs://{bucket_name}/{gcs_key}"
+
+
+def count_jsonl_lines(path: Path) -> int:
+    n = 0
+    with open(path, "r") as f:
+        for line in f:
+            if line.strip():
+                n += 1
+    return n
+
+
+def submit_tuning_job(
+    *,
+    project: str,
+    location: str,
+    source_model: str,
+    train_uri: str,
+    val_uri: str | None,
+    epochs: int,
+    learning_rate_multiplier: float,
+    adapter_size: int,
+    tuned_model_display_name: str,
+):
+    """
+    Kick off a Vertex AI Supervised Tuning job for Gemini Flash.
+
+    Returns the SftTuningJob handle (which is poll-able via .refresh()).
+    """
+    import vertexai  # type: ignore
+    from vertexai.tuning import sft  # type: ignore
+
+    vertexai.init(project=project, location=location)
+
+    print()
+    print("=" * 70)
+    print("SUBMITTING VERTEX AI SFT TUNING JOB")
+    print("=" * 70)
+    print(f"  Project:           {project}")
+    print(f"  Location:          {location}")
+    print(f"  Source model:      {source_model}")
+    print(f"  Train dataset:     {train_uri}")
+    print(f"  Val dataset:       {val_uri or '(none)'}")
+    print(f"  Epochs:            {epochs}")
+    print(f"  LR multiplier:     {learning_rate_multiplier}")
+    print(f"  Adapter size:      {adapter_size}")
+    print(f"  Display name:      {tuned_model_display_name}")
+    print("=" * 70)
+
+    kwargs = dict(
+        source_model=source_model,
+        train_dataset=train_uri,
+        epochs=epochs,
+        learning_rate_multiplier=learning_rate_multiplier,
+        adapter_size=adapter_size,
+        tuned_model_display_name=tuned_model_display_name,
+    )
+    if val_uri:
+        kwargs["validation_dataset"] = val_uri
+
+    job = sft.train(**kwargs)
+    print(f"[INFO] Submitted job: {job.resource_name}")
+    return job
+
+
+def poll_until_done(job, poll_seconds: int = 60) -> None:
+    """Block until the tuning job ends, printing progress."""
+    started = time.time()
+    while not job.has_ended:
+        elapsed = int(time.time() - started)
+        print(
+            f"[INFO] Tuning in progress... elapsed={elapsed}s "
+            f"state={getattr(job, 'state', '?')}"
+        )
+        time.sleep(poll_seconds)
+        job.refresh()
+    print(f"[INFO] Tuning job ended. state={getattr(job, 'state', '?')}")
+
+
+def save_tuned_model_metadata(
+    config: dict, job, *, train_uri: str, val_uri: str | None
+) -> Path:
+    """
+    Persist the tuned model's resource name and endpoint so eval_sft.py
+    (and downstream RL) can find it without rerunning the job.
+    """
+    out_path = Path(config["data"]["tuned_model_metadata"])
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    metadata = {
+        "tuned_model_name": getattr(job, "tuned_model_name", None),
+        "tuned_model_endpoint_name": getattr(job, "tuned_model_endpoint_name", None),
+        "experiment": getattr(job, "experiment", None),
+        "resource_name": getattr(job, "resource_name", None),
+        "state": str(getattr(job, "state", None)),
+        "source_model": config["model"]["source_model"],
+        "tuned_model_display_name": config["model"]["tuned_model_display_name"],
+        "train_dataset": train_uri,
+        "val_dataset": val_uri,
+        "tuning_hyperparameters": config["tuning"],
+        "reward_coefficients": config["reward"],
+        "filtering_thresholds": config["filtering"],
     }
-
-    if use_4bit:
-        bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_use_double_quant=True,
-        )
-        model_kwargs["quantization_config"] = bnb_config
-        print("[INFO] Using NF4 quantization with double quantization")
-
-    model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
-
-    if use_4bit:
-        model = prepare_model_for_kbit_training(model)
-
-    # Enable gradient checkpointing for memory savings
-    if config["training"].get("gradient_checkpointing", True):
-        model.gradient_checkpointing_enable()
-        print("[INFO] Gradient checkpointing enabled")
-
-    param_count = sum(p.numel() for p in model.parameters())
-    print(f"[INFO] Model parameters: {param_count / 1e6:.1f}M")
-
-    return model, tokenizer
+    with open(out_path, "w") as f:
+        json.dump(metadata, f, indent=2)
+    return out_path
 
 
-def setup_lora(model, config: dict):
-    """
-    Apply LoRA adapters to the model for parameter-efficient fine-tuning.
-
-    LoRA adds small trainable rank-decomposition matrices to the attention
-    layers. With r=16 and targeting q/k/v/o projections, we add ~0.5% new
-    trainable parameters while keeping 99.5% of the model frozen.
-
-    Benefits for the integrity-aware RL pipeline:
-        1. Memory: Fits 7B model training on a single 24GB GPU
-        2. Preservation: Base model capabilities are maintained
-        3. Modularity: Easy to merge/swap adapters for evaluation
-        4. Speed: Training is faster with fewer gradient computations
-        5. RL readiness: Same adapter approach works for Phase 2 PPO/DPO
-
-    Args:
-        model:  Base language model (optionally quantized).
-        config: Configuration with LoRA hyperparameters.
-
-    Returns:
-        PEFT model with LoRA adapters attached.
-    """
-    lora_cfg = config["lora"]
-
-    lora_config = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
-        r=lora_cfg["r"],                          # Rank: 16
-        lora_alpha=lora_cfg["alpha"],              # Alpha: 32 (scaling = alpha/r = 2)
-        lora_dropout=lora_cfg["dropout"],          # Dropout: 0.05
-        target_modules=lora_cfg["target_modules"], # q_proj, k_proj, v_proj, o_proj
-        bias="none",                               # Don't train biases
-    )
-
-    model = get_peft_model(model, lora_config)
-
-    # Print trainable parameter summary
-    model.print_trainable_parameters()
-
-    return model
-
-
-def verify_dataset_safety(dataset) -> None:
-    """
-    Final safety verification before training begins.
-
-    This is the LAST line of defense against accidentally training on
-    reward-hacking trajectories. Runs before any gradient computation.
-
-    Checks:
-        - Dataset is non-empty
-        - Required fields are present
-        - Sample format is correct
-
-    Note: The per-trajectory is_reward_hack assertion was already run in
-    build_sft_dataset.py. This provides a structural check.
-
-    Raises:
-        AssertionError: If dataset is empty or missing required fields.
-    """
-    print("[INFO] Running final safety verification on training dataset...")
-
-    assert len(dataset) > 0, (
-        "SAFETY CHECK FAILED: Dataset is empty! "
-        "No honest trajectories to train on. Aborting."
-    )
-
-    # Verify expected fields exist in the first example
-    sample = dataset[0]
-    assert "messages" in sample or "input_ids" in sample, (
-        "SAFETY CHECK FAILED: Dataset missing required fields "
-        "(expected 'messages' or 'input_ids'). Aborting."
-    )
-
-    print(
-        f"[INFO] Safety verification PASSED: "
-        f"{len(dataset)} clean examples ready for training"
-    )
-
-
-def create_formatting_func(tokenizer):
-    """
-    Create a formatting function for SFTTrainer.
-
-    Converts the messages list in each example to the model's chat template
-    format. Using the model's native chat template ensures compatibility
-    with the instruction-following format learned during pre-training.
-
-    For Qwen2.5 models, this produces:
-        <|im_start|>system
-        ...
-        <|im_end|>
-        <|im_start|>user
-        ...
-        <|im_end|>
-        <|im_start|>assistant
-        ...
-        <|im_end|>
-
-    Args:
-        tokenizer: HuggingFace tokenizer with chat template support.
-
-    Returns:
-        Formatting function compatible with SFTTrainer.
-    """
-
-    def formatting_func(example):
-        messages = example["messages"]
-        text = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=False
-        )
-        return text
-
-    return formatting_func
-
-
-def main():
-    """
-    Main entry point: setup, verify, train, and save the SFT warm-started model.
-
-    Training pipeline:
-        1. Load config and dataset
-        2. Run safety verification (no reward hacks in data)
-        3. Load base model with optional 4-bit quantization
-        4. Attach LoRA adapters
-        5. Configure completion-only loss masking
-        6. Train with SFTTrainer
-        7. Save final checkpoint with metadata
-    """
+def main() -> None:
     parser = argparse.ArgumentParser(
-        description="SFT training for integrity-aware RL warm start"
+        description=(
+            "Submit a Vertex AI Supervised Tuning job for the SFT warm start."
+        )
     )
     parser.add_argument(
         "--config",
@@ -261,181 +273,106 @@ def main():
         help="Path to configuration YAML file",
     )
     parser.add_argument(
-        "--dry_run",
-        action="store_true",
-        help="Run only 10 steps to verify the full pipeline works end-to-end",
+        "--env-file",
+        type=str,
+        default=".env",
+        help="Path to .env (default ./.env at the repo root)",
     )
     parser.add_argument(
-        "--model",
-        type=str,
-        default=None,
-        help="Override model name from config",
+        "--dry_run",
+        action="store_true",
+        help=(
+            "Validate config, ensure bucket exists, upload dataset, but "
+            "do NOT submit a tuning job. Use to verify auth + plumbing."
+        ),
+    )
+    parser.add_argument(
+        "--skip_upload",
+        action="store_true",
+        help="Reuse already-uploaded GCS dataset; just submit the job.",
     )
     args = parser.parse_args()
 
-    # --- Load config ---
     config = load_config(args.config)
-    if args.model:
-        config["model"]["name"] = args.model
-    train_cfg = config["training"]
+    project, location, bucket, prefix = resolve_vertex_settings(
+        config, env_file=Path(args.env_file)
+    )
 
-    # --- Load dataset ---
-    dataset_dir = config["data"]["dataset_output_dir"]
-    print(f"[INFO] Loading SFT dataset from {dataset_dir}")
-    dataset = load_from_disk(dataset_dir)
-    print(f"[INFO] Dataset size: {len(dataset)} examples")
+    # --- Verify dataset files exist and are non-empty ---
+    train_path = Path(config["data"]["vertex_train_path"])
+    val_path = Path(config["data"]["vertex_val_path"])
 
-    # --- Safety verification ---
-    verify_dataset_safety(dataset)
+    if not train_path.exists():
+        print(
+            f"ERROR: Training file not found: {train_path}. Run "
+            "`python -m data.build_sft_dataset` first.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
-    # --- Setup model and LoRA ---
-    model, tokenizer = setup_model_and_tokenizer(config)
-    model = setup_lora(model, config)
+    n_train = count_jsonl_lines(train_path)
+    n_val = count_jsonl_lines(val_path) if val_path.exists() else 0
+    min_examples = int(config["dataset_limits"]["min_examples"])
+    print(f"[INFO] Train examples: {n_train}; Val examples: {n_val}")
+    assert n_train >= min_examples, (
+        f"SAFETY CHECK FAILED: training set has {n_train} examples, "
+        f"Vertex SFT requires at least {min_examples}."
+    )
 
-    # --- Output directories ---
-    output_dir = train_cfg["output_dir"]
-    logging_dir = train_cfg.get("logging_dir", f"{output_dir}/logs")
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
-    Path(logging_dir).mkdir(parents=True, exist_ok=True)
+    # --- Bucket + upload ---
+    train_uri: str | None = None
+    val_uri: str | None = None
+    if not args.skip_upload:
+        ensure_bucket(project, location, bucket)
+        train_key = f"{prefix}/{train_path.name}"
+        train_uri = upload_to_gcs(project, bucket, train_path, train_key)
+        if n_val > 0:
+            val_key = f"{prefix}/{val_path.name}"
+            val_uri = upload_to_gcs(project, bucket, val_path, val_key)
+    else:
+        train_uri = f"gs://{bucket}/{prefix}/{train_path.name}"
+        if n_val > 0:
+            val_uri = f"gs://{bucket}/{prefix}/{val_path.name}"
+        print(f"[INFO] Skipping upload, reusing {train_uri}")
 
-    # --- Dry run adjustments ---
-    max_steps = -1
-    num_epochs = train_cfg["num_train_epochs"]
     if args.dry_run:
-        max_steps = 10
-        num_epochs = 1
-        print("\n" + "*" * 50)
-        print("* DRY RUN MODE: Running 10 steps only")
-        print("*" * 50 + "\n")
+        print("\n[DRY RUN] Skipping tuning-job submission.")
+        print("[DRY RUN] Auth, bucket, and upload all succeeded.")
+        return
 
-    # --- Data collator for completion-only loss masking ---
-    # This ensures loss is ONLY computed on assistant responses.
-    # For Qwen2.5 models, the assistant turn starts with "<|im_start|>assistant\n"
-    # and user turns start with "<|im_start|>user\n".
-    response_template = "<|im_start|>assistant\n"
-    instruction_template = "<|im_start|>user\n"
-
-    collator = DataCollatorForCompletionOnlyLM(
-        response_template=response_template,
-        instruction_template=instruction_template,
-        tokenizer=tokenizer,
+    # --- Submit + poll ---
+    tcfg = config["tuning"]
+    job = submit_tuning_job(
+        project=project,
+        location=location,
+        source_model=config["model"]["source_model"],
+        train_uri=train_uri,
+        val_uri=val_uri,
+        epochs=int(tcfg["epochs"]),
+        learning_rate_multiplier=float(tcfg["learning_rate_multiplier"]),
+        adapter_size=int(tcfg["adapter_size"]),
+        tuned_model_display_name=config["model"]["tuned_model_display_name"],
     )
 
-    # --- Training arguments ---
-    training_args = SFTConfig(
-        output_dir=output_dir,
-        num_train_epochs=num_epochs,
-        max_steps=max_steps,
-        per_device_train_batch_size=train_cfg["per_device_train_batch_size"],
-        gradient_accumulation_steps=train_cfg["gradient_accumulation_steps"],
-        learning_rate=train_cfg["learning_rate"],
-        warmup_ratio=train_cfg["warmup_ratio"],
-        bf16=train_cfg["bf16"],
-        gradient_checkpointing=train_cfg["gradient_checkpointing"],
-        logging_dir=logging_dir,
-        logging_steps=train_cfg["logging_steps"],
-        save_steps=train_cfg["save_steps"],
-        save_total_limit=3,
-        report_to="tensorboard",
-        packing=train_cfg.get("packing", False),
-        max_seq_length=config["model"]["max_length"],
-        dataset_text_field=None,
-        remove_unused_columns=False,
+    poll_until_done(job)
+
+    # --- Save metadata for downstream eval / RL ---
+    out_path = save_tuned_model_metadata(
+        config, job, train_uri=train_uri, val_uri=val_uri
     )
 
-    # --- Create formatting function ---
-    formatting_func = create_formatting_func(tokenizer)
-
-    # --- Initialize SFTTrainer ---
-    trainer = SFTTrainer(
-        model=model,
-        args=training_args,
-        train_dataset=dataset,
-        formatting_func=formatting_func,
-        data_collator=collator,
-        tokenizer=tokenizer,
-    )
-
-    # --- Print training summary ---
-    effective_batch = (
-        train_cfg["per_device_train_batch_size"]
-        * train_cfg["gradient_accumulation_steps"]
-    )
-    steps_per_epoch = max(len(dataset) // effective_batch, 1)
-    total_steps = steps_per_epoch * num_epochs if max_steps == -1 else max_steps
-
-    print("\n" + "=" * 70)
-    print("SFT TRAINING CONFIGURATION")
+    print()
     print("=" * 70)
-    print(f"  Model:              {config['model']['name']}")
-    print(f"  4-bit quantization: {config['model'].get('use_4bit', False)}")
-    print(f"  LoRA r / alpha:     {config['lora']['r']} / {config['lora']['alpha']}")
-    print(f"  Target modules:     {config['lora']['target_modules']}")
-    print(f"  Learning rate:      {train_cfg['learning_rate']}")
-    print(f"  Epochs:             {num_epochs}")
-    print(f"  Batch size:         {train_cfg['per_device_train_batch_size']}")
-    print(f"  Grad accumulation:  {train_cfg['gradient_accumulation_steps']}")
-    print(f"  Effective batch:    {effective_batch}")
-    print(f"  Steps per epoch:    {steps_per_epoch}")
-    print(f"  Total steps:        {total_steps}")
-    print(f"  Max seq length:     {config['model']['max_length']}")
-    print(f"  Dataset size:       {len(dataset)} examples")
-    print(f"  Output dir:         {output_dir}")
-    print(f"  TensorBoard dir:    {logging_dir}")
-    print(f"  Dry run:            {args.dry_run}")
-    print("=" * 70 + "\n")
-
-    # --- Train ---
-    print("[INFO] Starting SFT training...")
-    train_result = trainer.train()
-
-    # --- Save final model ---
-    final_dir = Path(output_dir) / "final"
-    final_dir.mkdir(parents=True, exist_ok=True)
-    trainer.save_model(str(final_dir))
-    tokenizer.save_pretrained(str(final_dir))
-
-    # --- Print results ---
-    print(f"\n{'=' * 70}")
-    print("TRAINING COMPLETE")
-    print(f"{'=' * 70}")
-    print(f"  Final train loss:     {train_result.training_loss:.4f}")
-    print(f"  Total steps:          {train_result.global_step}")
-    print(f"  Model saved to:       {final_dir}")
-    print(f"  TensorBoard logs at:  {logging_dir}")
-    print(f"  View with:  tensorboard --logdir {logging_dir}")
-    print(f"{'=' * 70}")
-
-    # --- Save training metadata ---
-    metadata = {
-        "model": config["model"]["name"],
-        "dataset_size": len(dataset),
-        "epochs": num_epochs,
-        "total_steps": train_result.global_step,
-        "final_loss": train_result.training_loss,
-        "dry_run": args.dry_run,
-        "lora_config": config["lora"],
-        "training_config": {
-            k: v
-            for k, v in train_cfg.items()
-            if k not in ["output_dir", "logging_dir"]
-        },
-        "reward_coefficients": config["reward"],
-        "filtering_thresholds": config["filtering"],
-    }
-    metadata_path = final_dir / "training_metadata.json"
-    with open(metadata_path, "w") as f:
-        json.dump(metadata, f, indent=2)
-
-    print(f"[INFO] Training metadata saved to {metadata_path}")
-
-    # --- Final dataset safety summary ---
+    print("TUNING COMPLETE")
+    print("=" * 70)
+    print(f"  Tuned model name:      {getattr(job, 'tuned_model_name', '?')}")
+    print(f"  Tuned model endpoint:  {getattr(job, 'tuned_model_endpoint_name', '?')}")
+    print(f"  Saved metadata:        {out_path}")
+    print()
     print(
-        f"\n[SAFETY] Confirmed: trained on {len(dataset)} "
-        f"verified honest trajectories"
+        "[NEXT] Evaluate the tuned model on previously-hacked instances:\n"
+        "         python -m evaluation.eval_sft --config config/sft_config.yaml"
     )
-    print(f"[SAFETY] Zero reward-hacking trajectories in training data")
-    print(f"[SAFETY] SFT warm start ready for Phase 2 RL fine-tuning")
 
 
 if __name__ == "__main__":

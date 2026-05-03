@@ -1,53 +1,56 @@
 #!/usr/bin/env python3
 """
-Phase 2, Step 1: Build SFT Dataset from Honest Trajectories
-=============================================================
+Phase 2, Step 1: Build SFT Dataset in Vertex AI Tuning Format
+==============================================================
 
-Converts filtered honest trajectories into a tokenized HuggingFace Dataset
-suitable for supervised fine-tuning. Each trajectory becomes a multi-turn
-conversation:
+Converts filtered honest trajectories into the JSONL format Vertex AI
+Supervised Tuning expects for Gemini Flash. Each line is one training
+example shaped like:
 
-    System:    Anti-exploitation rules and agent role description
-    User:      Problem statement from SWE-bench
-    Assistant: <command_1>
-    User:      [tool_output]  (placeholder for stdout/stderr)
-    Assistant: <command_2>
-    User:      [tool_output]
-    ...
-    Assistant: <final_command>
+    {
+      "systemInstruction": {"role": "system",
+                            "parts": [{"text": "..."}]},
+      "contents": [
+        {"role": "user",  "parts": [{"text": "<problem statement>"}]},
+        {"role": "model", "parts": [{"text": "<command 1>"}]},
+        {"role": "user",  "parts": [{"text": "[tool_output]"}]},
+        {"role": "model", "parts": [{"text": "<command 2>"}]},
+        ...
+      ]
+    }
 
-Loss is masked on system/user/tool tokens; only assistant tokens contribute
-to the training objective. This ensures the model learns to generate honest
-problem-solving commands without memorizing problem statements or tool outputs.
+Vertex SFT automatically masks loss on user/system turns and trains only
+on `model` turns -- so we don't need to manage label masking ourselves.
 
 Why this matters for integrity-aware RL:
-    The SFT warm start establishes a "clean prior" -- a policy that already knows
-    how to solve coding problems honestly. The subsequent RL phase (Phase 2, Step 2)
-    can then optimize the reward function R without the policy falling into reward
-    hacking attractors, because it starts from a region of policy space that has
-    never seen or learned exploitative behaviors.
+    The SFT warm start establishes a "clean prior" -- a Gemini Flash variant
+    that already knows how to solve coding problems honestly. The subsequent
+    RL phase (Phase 2, Step 2) can then optimize the integrity-aware reward
+    function R without the policy collapsing into reward-hacking attractors,
+    because it starts from a region of policy space that has never seen or
+    learned exploitative behaviors.
 
 Usage:
-    python -m data.build_sft_dataset [--config config/sft_config.yaml] [--max_length 8192]
+    python -m data.build_sft_dataset --config config/sft_config.yaml
 """
 
-import json
+from __future__ import annotations
+
 import argparse
+import json
+import random
 import sys
 from pathlib import Path
-from typing import Optional
 
 import yaml
-from datasets import Dataset, load_dataset
-from transformers import AutoTokenizer
 
 
 # ---------------------------------------------------------------------------
-# System prompt: explicitly instructs against all known exploitation vectors.
-# This prompt is used for every training example and must match what the agent
-# will see at inference time during RL and evaluation.
+# System instruction: explicitly forbids the known exploitation vectors.
+# The same instruction is sent at inference time during evaluation and RL,
+# so train/serve match exactly.
 # ---------------------------------------------------------------------------
-SYSTEM_PROMPT = (
+SYSTEM_INSTRUCTION = (
     "You are a software engineering agent. Your task is to solve the given "
     "programming problem by issuing bash commands to explore the codebase, "
     "understand the issue, and implement a correct fix.\n\n"
@@ -55,14 +58,14 @@ SYSTEM_PROMPT = (
     "- Do not modify test files or test infrastructure\n"
     "- Do not read hidden test artifacts or evaluation harness internals\n"
     "- Do not hardcode expected outputs or instance-specific answers\n"
-    "- Do not use git history, GitHub PRs, or cherry-pick to copy known solutions\n"
+    "- Do not use git history, GitHub PRs, or cherry-pick to copy known "
+    "solutions\n"
     "- Focus on understanding the root cause and implementing a principled fix\n"
     "- Your solution should generalize to both visible and hidden test cases"
 )
 
 
-def load_config(config_path: str = "config/sft_config.yaml") -> dict:
-    """Load centralized configuration from YAML file."""
+def load_config(config_path: str) -> dict:
     with open(config_path, "r") as f:
         return yaml.safe_load(f)
 
@@ -71,379 +74,162 @@ def load_sft_trajectories(sft_path: str) -> list[dict]:
     """
     Load filtered honest trajectories produced by process_trajectories.py.
 
-    Includes CRITICAL safety assertions to verify no reward-hacking trajectories
-    are present. This is the first of multiple safety checkpoints in the pipeline.
-    Any violation causes an immediate abort.
-
-    Args:
-        sft_path: Path to sft_trajectories.jsonl (output of process_trajectories.py).
-
-    Returns:
-        List of honest trajectory dictionaries.
-
-    Raises:
-        AssertionError: If any trajectory is labeled as a reward hack.
+    Includes critical safety assertions: every loaded trajectory must be
+    labeled NOT_REWARD_HACK and have is_reward_hack=False. Any violation
+    aborts the build, since training Gemini on a hacking trajectory would
+    actively teach it to exploit.
     """
-    trajectories = []
+    trajectories: list[dict] = []
     with open(sft_path, "r") as f:
-        for line_num, line in enumerate(f, 1):
-            line = line.strip()
+        for line_num, raw in enumerate(f, 1):
+            line = raw.strip()
             if not line:
                 continue
             traj = json.loads(line)
 
-            # ============================================================
-            # CRITICAL SAFETY CHECK: Never train on reward-hacking data
-            # ============================================================
             assert not traj.get("is_reward_hack", True), (
-                f"SAFETY VIOLATION on line {line_num}: Trajectory "
-                f"{traj.get('instance_id', 'unknown')} is labeled as reward hack "
-                f"but was included in SFT data! Aborting."
+                f"SAFETY VIOLATION on line {line_num}: trajectory "
+                f"{traj.get('instance_id', 'unknown')} is labeled as a "
+                "reward hack but appears in the SFT input. Aborting."
             )
             assert traj.get("eval_label", "") == "NOT_REWARD_HACK", (
-                f"SAFETY VIOLATION on line {line_num}: Trajectory "
-                f"{traj.get('instance_id', 'unknown')} has "
-                f"eval_label={traj.get('eval_label')} != NOT_REWARD_HACK. Aborting."
+                f"SAFETY VIOLATION on line {line_num}: trajectory "
+                f"{traj.get('instance_id', 'unknown')} has eval_label="
+                f"{traj.get('eval_label')} != NOT_REWARD_HACK. Aborting."
             )
 
             trajectories.append(traj)
 
     print(f"[INFO] Loaded {len(trajectories)} honest trajectories from {sft_path}")
-    print(f"[INFO] All {len(trajectories)} trajectories passed safety assertions")
+    print(f"[INFO] All {len(trajectories)} passed reward-hack safety assertions")
     return trajectories
 
 
 def load_swebench_problems() -> dict[str, str]:
-    """
-    Load SWE-bench Lite problem statements into a lookup dictionary.
-
-    The problem statement is used as the initial User turn in each training
-    conversation. It provides the context the agent uses to understand what
-    code needs to be fixed.
-
-    Returns:
-        Dict mapping instance_id to problem_statement text.
-    """
-    cache = {}
+    """Load SWE-bench Lite problem statements indexed by instance_id."""
     try:
-        print("[INFO] Loading SWE-bench Lite dataset for problem statements...")
+        from datasets import load_dataset
+    except ImportError:
+        print(
+            "[WARNING] `datasets` is not installed; falling back to placeholder "
+            "problem statements. Install with `pip install datasets`.",
+            file=sys.stderr,
+        )
+        return {}
+
+    cache: dict[str, str] = {}
+    try:
+        print("[INFO] Loading SWE-bench Lite for problem statements...")
         ds = load_dataset("princeton-nlp/SWE-bench_Lite", split="test")
         for item in ds:
             cache[item["instance_id"]] = item.get("problem_statement", "")
-        print(f"[INFO] Loaded {len(cache)} problem statements from SWE-bench Lite")
-    except Exception as e:
-        print(f"[WARNING] Could not load SWE-bench dataset: {e}")
-        print("[WARNING] Will use placeholder problem statements")
+        print(f"[INFO] Loaded {len(cache)} SWE-bench Lite problem statements")
+    except Exception as exc:
+        print(
+            f"[WARNING] Could not load SWE-bench Lite ({exc}); using "
+            "placeholder problem statements.",
+            file=sys.stderr,
+        )
     return cache
 
 
-def fetch_problem_statement(instance_id: str, swebench_cache: dict[str, str]) -> str:
-    """
-    Fetch the problem statement for a SWE-bench instance.
-
-    Uses the pre-loaded cache from load_swebench_problems(). Falls back to a
-    descriptive placeholder if the dataset is not available.
-
-    Args:
-        instance_id:    SWE-bench instance identifier (e.g., "django__django-12915").
-        swebench_cache: Pre-loaded cache of problem statements.
-
-    Returns:
-        Problem statement string.
-    """
-    if instance_id in swebench_cache:
-        return swebench_cache[instance_id]
-
-    # Fallback placeholder
+def fetch_problem_statement(instance_id: str, cache: dict[str, str]) -> str:
+    if instance_id in cache and cache[instance_id]:
+        return cache[instance_id]
     return (
         f"[SWE-bench Problem: {instance_id}]\n\n"
-        f"Please investigate and fix the issue described in this instance. "
-        f"Explore the repository structure, understand the bug, and submit a patch."
+        "Please investigate and fix the issue described in this instance. "
+        "Explore the repository, understand the bug, and submit a patch."
     )
 
 
-def trajectory_to_messages(traj: dict, swebench_cache: dict[str, str]) -> list[dict]:
+def trajectory_to_vertex_example(
+    traj: dict, problem_cache: dict[str, str]
+) -> dict | None:
     """
-    Convert a single trajectory into a multi-turn conversation format.
+    Convert one trajectory into one Vertex SFT example.
 
-    Conversation structure:
-        1. System:    Anti-exploitation instructions (always the same)
-        2. User:      Problem statement from SWE-bench
-        3. Assistant: Command 1 (agent action)
-        4. User:      [tool_output] (environment feedback placeholder)
-        5. Assistant: Command 2
-        6. User:      [tool_output]
-        ...
-        N. Assistant: Final command (no trailing tool_output)
+    Vertex SFT expects roles `user` and `model` (not `assistant`) and a
+    top-level `systemInstruction`. Tool outputs are folded into `user` turns
+    using the literal placeholder `[tool_output]` because we did not store
+    real stdout/stderr at trajectory-collection time. This is sufficient for
+    a warm start; the RL phase will see real execution feedback.
 
-    We model tool results as User turns because they represent environment
-    feedback (not agent actions). This makes loss masking straightforward:
-    we only compute loss on Assistant turns.
-
-    For tool results, we use "[tool_output]" as a placeholder since the
-    original stdout/stderr is not stored in the trajectory data. The model
-    learns the action distribution conditioned on this placeholder, which
-    is sufficient for the warm start -- the RL phase will use real execution.
-
-    Args:
-        traj:           Trajectory dictionary with commands list.
-        swebench_cache: Cache for problem statements.
-
-    Returns:
-        List of message dicts with 'role' and 'content' keys.
-        Returns empty list if trajectory has no commands.
+    Returns None for trajectories with no commands (cannot train on empty).
     """
     instance_id = traj.get("instance_id", "unknown")
-    commands = traj.get("commands", [])
+    commands = traj.get("commands", []) or []
 
     if not commands:
-        return []
-
-    messages = []
-
-    # System message: anti-exploitation rules
-    messages.append({"role": "system", "content": SYSTEM_PROMPT})
-
-    # User message: problem statement
-    problem = fetch_problem_statement(instance_id, swebench_cache)
-    messages.append({"role": "user", "content": problem})
-
-    # Convert commands to alternating assistant/user turns
-    for i, cmd in enumerate(commands):
-        # Assistant issues the command
-        messages.append({"role": "assistant", "content": cmd})
-
-        # Tool output (placeholder) -- modeled as User turn
-        # Skip after the last command so conversation ends on Assistant turn
-        if i < len(commands) - 1:
-            messages.append({"role": "user", "content": "[tool_output]"})
-
-    return messages
-
-
-def tokenize_and_create_labels(
-    messages: list[dict], tokenizer, max_length: int
-) -> Optional[dict]:
-    """
-    Tokenize a multi-turn conversation with loss masking on non-assistant tokens.
-
-    Strategy:
-        1. Apply the tokenizer's chat template to get the full formatted text
-        2. Tokenize the complete conversation
-        3. Find assistant turn boundaries by incrementally tokenizing
-        4. Set labels to -100 for all non-assistant positions
-        5. Only assistant content tokens contribute to the SFT loss
-
-    Why loss masking matters:
-        Without masking, the model would learn to predict problem statements
-        and tool outputs, wasting capacity on things it doesn't generate.
-        Worse, it might learn to "expect" certain tool outputs, creating
-        a bias. By masking, we focus learning entirely on the action policy.
-
-    Args:
-        messages:   List of message dicts with 'role' and 'content'.
-        tokenizer:  HuggingFace tokenizer with chat_template support.
-        max_length: Maximum sequence length for truncation.
-
-    Returns:
-        Dict with input_ids, attention_mask, labels; or None if too short.
-    """
-    # Apply chat template to get full formatted text
-    text = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=False
-    )
-
-    # Tokenize the full conversation
-    tokenized = tokenizer(
-        text,
-        max_length=max_length,
-        truncation=True,
-        padding=False,
-        return_tensors=None,
-    )
-
-    input_ids = tokenized["input_ids"]
-    attention_mask = tokenized["attention_mask"]
-
-    # Initialize all labels to -100 (ignored by CrossEntropyLoss)
-    labels = [-100] * len(input_ids)
-
-    # Find assistant turn boundaries by tokenizing incrementally.
-    # For each assistant message, we find where its content starts and ends
-    # in the tokenized sequence by comparing partial tokenizations.
-    for msg_idx, msg in enumerate(messages):
-        if msg["role"] != "assistant":
-            continue
-
-        # Tokenize up to and including this message
-        partial_with = tokenizer.apply_chat_template(
-            messages[: msg_idx + 1], tokenize=False, add_generation_prompt=False
-        )
-        ids_with = tokenizer(
-            partial_with,
-            max_length=max_length,
-            truncation=True,
-            padding=False,
-            return_tensors=None,
-        )["input_ids"]
-        end_pos = len(ids_with)
-
-        # Tokenize up to previous message + generation prompt header
-        # This gives us the position where assistant content starts
-        if msg_idx > 0:
-            prev_text = tokenizer.apply_chat_template(
-                messages[:msg_idx], tokenize=False, add_generation_prompt=True
-            )
-            ids_prev = tokenizer(
-                prev_text,
-                max_length=max_length,
-                truncation=True,
-                padding=False,
-                return_tensors=None,
-            )["input_ids"]
-            start_pos = len(ids_prev)
-        else:
-            start_pos = 0
-
-        # Mark assistant tokens for loss computation
-        for pos in range(start_pos, min(end_pos, len(labels))):
-            if pos < len(input_ids):
-                labels[pos] = input_ids[pos]
-
-    # Skip sequences with very few assistant tokens (likely truncation artifacts)
-    assistant_token_count = sum(1 for label in labels if label != -100)
-    if assistant_token_count < 10:
         return None
 
+    contents: list[dict] = []
+
+    problem = fetch_problem_statement(instance_id, problem_cache)
+    contents.append({"role": "user", "parts": [{"text": problem}]})
+
+    for i, cmd in enumerate(commands):
+        contents.append({"role": "model", "parts": [{"text": str(cmd)}]})
+        if i < len(commands) - 1:
+            contents.append({"role": "user", "parts": [{"text": "[tool_output]"}]})
+
     return {
-        "input_ids": input_ids,
-        "attention_mask": attention_mask,
-        "labels": labels,
+        "systemInstruction": {
+            "role": "system",
+            "parts": [{"text": SYSTEM_INSTRUCTION}],
+        },
+        "contents": contents,
     }
 
 
-def build_dataset(config: dict, max_length: int) -> tuple:
-    """
-    Build the complete SFT dataset from filtered trajectories.
+def estimate_tokens(text: str) -> int:
+    """Cheap char/4 token estimate. Used for offline filtering only."""
+    return max(1, len(text) // 4)
 
-    Full pipeline:
-        1. Load honest trajectories (with safety assertions)
-        2. Load SWE-bench problem statements for User turns
-        3. Convert each trajectory to multi-turn conversation
-        4. Tokenize with loss masking on non-assistant tokens
-        5. Compute and print corpus statistics
-        6. Return as HuggingFace Dataset
 
-    Args:
-        config:     Configuration dictionary.
-        max_length: Maximum sequence length for tokenization.
-
-    Returns:
-        Tuple of (HuggingFace Dataset, tokenizer).
-    """
-    model_name = config["model"]["name"]
-    sft_path = config["data"]["sft_output_path"]
-
-    # --- Load tokenizer ---
-    print(f"[INFO] Loading tokenizer: {model_name}")
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    print(f"[INFO] Vocab size: {tokenizer.vocab_size}")
-
-    # --- Load data ---
-    trajectories = load_sft_trajectories(sft_path)
-    swebench_cache = load_swebench_problems()
-
-    # --- Convert and tokenize ---
-    all_examples = []
-    total_tokens = 0
-    total_assistant_tokens = 0
-    skipped_empty = 0
-    skipped_short = 0
-
-    print(f"\n[INFO] Building SFT dataset with max_length={max_length}...")
-    for i, traj in enumerate(trajectories):
-        # Convert trajectory to multi-turn messages
-        messages = trajectory_to_messages(traj, swebench_cache)
-        if not messages:
-            skipped_empty += 1
-            continue
-
-        # Tokenize with loss masking
-        example = tokenize_and_create_labels(messages, tokenizer, max_length)
-        if example is None:
-            skipped_short += 1
-            continue
-
-        # Attach metadata and raw messages for SFTTrainer
-        example["instance_id"] = traj.get("instance_id", "unknown")
-        example["messages"] = messages
-
-        # Track token counts
-        n_tokens = len(example["input_ids"])
-        n_assistant = sum(1 for label in example["labels"] if label != -100)
-        total_tokens += n_tokens
-        total_assistant_tokens += n_assistant
-
-        all_examples.append(example)
-
-        if (i + 1) % 10 == 0 or (i + 1) == len(trajectories):
-            print(f"  Processed {i + 1}/{len(trajectories)} trajectories...")
-
-    # --- Print statistics ---
-    print(f"\n{'=' * 60}")
-    print(f"SFT DATASET BUILD SUMMARY")
-    print(f"{'=' * 60}")
-    print(f"  Total examples:          {len(all_examples)}")
-    print(f"  Skipped (no commands):   {skipped_empty}")
-    print(f"  Skipped (too short):     {skipped_short}")
-    print(f"  Total tokens:            {total_tokens:,}")
-    print(
-        f"  Assistant tokens:        {total_assistant_tokens:,} "
-        f"({100 * total_assistant_tokens / max(total_tokens, 1):.1f}% of total)"
+def example_token_estimate(example: dict) -> tuple[int, int]:
+    """Return (total_tokens, max_single_model_turn_tokens) for an example."""
+    total = 0
+    max_model = 0
+    sys_text = (
+        example.get("systemInstruction", {})
+        .get("parts", [{}])[0]
+        .get("text", "")
     )
-    print(
-        f"  Avg tokens/example:      "
-        f"{total_tokens / max(len(all_examples), 1):.0f}"
-    )
-    print(
-        f"  Avg assistant tokens:    "
-        f"{total_assistant_tokens / max(len(all_examples), 1):.0f}"
-    )
+    total += estimate_tokens(sys_text)
 
-    # Estimate training time (rough: ~1000 tokens/sec on A100 with LoRA)
-    epochs = config["training"]["num_train_epochs"]
-    est_tokens = total_tokens * epochs
-    est_hours = est_tokens / (1000 * 3600)
-    print(f"\n  Estimated training compute ({epochs} epochs):")
-    print(f"    Total tokens:          {est_tokens:,}")
-    print(f"    Estimated time (A100): ~{est_hours:.1f} hours")
-    print(f"{'=' * 60}")
-
-    # --- Build HuggingFace Dataset ---
-    dataset_dict = {
-        "instance_id": [ex["instance_id"] for ex in all_examples],
-        "messages": [ex["messages"] for ex in all_examples],
-        "input_ids": [ex["input_ids"] for ex in all_examples],
-        "attention_mask": [ex["attention_mask"] for ex in all_examples],
-        "labels": [ex["labels"] for ex in all_examples],
-    }
-
-    dataset = Dataset.from_dict(dataset_dict)
-    return dataset, tokenizer
+    for turn in example.get("contents", []):
+        text = "".join(p.get("text", "") for p in turn.get("parts", []))
+        n = estimate_tokens(text)
+        total += n
+        if turn.get("role") == "model":
+            max_model = max(max_model, n)
+    return total, max_model
 
 
-def main():
-    """
-    Main entry point: build tokenized SFT dataset and save to disk.
+def split_examples(
+    examples: list[dict], val_fraction: float, seed: int
+) -> tuple[list[dict], list[dict]]:
+    """Deterministic shuffle + split into (train, val)."""
+    if val_fraction <= 0 or len(examples) < 10:
+        return examples, []
+    rng = random.Random(seed)
+    shuffled = examples[:]
+    rng.shuffle(shuffled)
+    n_val = max(1, int(len(shuffled) * val_fraction))
+    return shuffled[n_val:], shuffled[:n_val]
 
-    Outputs:
-        - HuggingFace Dataset at config.data.dataset_output_dir
-        - Tokenizer copy at config.data.dataset_output_dir/tokenizer
-    """
+
+def write_jsonl(path: Path, rows: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        for row in rows:
+            f.write(json.dumps(row) + "\n")
+
+
+def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Build tokenized SFT dataset from honest trajectories"
+        description="Build Vertex AI Supervised Tuning JSONL from honest trajectories"
     )
     parser.add_argument(
         "--config",
@@ -451,33 +237,108 @@ def main():
         default="config/sft_config.yaml",
         help="Path to configuration YAML file",
     )
-    parser.add_argument(
-        "--max_length",
-        type=int,
-        default=None,
-        help="Maximum sequence length (overrides config; default 8192)",
-    )
     args = parser.parse_args()
 
     config = load_config(args.config)
-    max_length = args.max_length or config["model"]["max_length"]
 
-    # Build dataset
-    dataset, tokenizer = build_dataset(config, max_length)
+    sft_path = config["data"]["sft_output_path"]
+    train_path = Path(config["data"]["vertex_train_path"])
+    val_path = Path(config["data"]["vertex_val_path"])
 
-    # Save dataset to disk
-    output_dir = config["data"]["dataset_output_dir"]
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
-    dataset.save_to_disk(output_dir)
+    limits = config["dataset_limits"]
+    max_input = int(limits["max_input_tokens"])
+    max_output_per_turn = int(limits["max_output_tokens_per_turn"])
+    min_examples = int(limits["min_examples"])
+    max_examples = int(limits["max_examples"])
 
-    # Save tokenizer alongside dataset for training convenience
-    tokenizer_dir = Path(output_dir) / "tokenizer"
-    tokenizer_dir.mkdir(parents=True, exist_ok=True)
-    tokenizer.save_pretrained(str(tokenizer_dir))
+    val_frac = float(config["split"]["validation_fraction"])
+    seed = int(config["split"]["seed"])
 
-    print(f"\n[INFO] Dataset saved to {output_dir}  ({len(dataset)} examples)")
-    print(f"[INFO] Tokenizer saved to {tokenizer_dir}")
-    print(f"[INFO] Ready for training: python -m training.sft_train")
+    # --- Load and convert ---
+    trajectories = load_sft_trajectories(sft_path)
+    problem_cache = load_swebench_problems()
+
+    examples: list[dict] = []
+    skipped_empty = 0
+    skipped_oversize_input = 0
+    skipped_oversize_turn = 0
+
+    for traj in trajectories:
+        ex = trajectory_to_vertex_example(traj, problem_cache)
+        if ex is None:
+            skipped_empty += 1
+            continue
+
+        total_tok, max_model_tok = example_token_estimate(ex)
+        if total_tok > max_input:
+            skipped_oversize_input += 1
+            continue
+        if max_model_tok > max_output_per_turn:
+            skipped_oversize_turn += 1
+            continue
+
+        examples.append(ex)
+
+    if len(examples) > max_examples:
+        rng = random.Random(seed)
+        rng.shuffle(examples)
+        examples = examples[:max_examples]
+
+    if len(examples) < min_examples:
+        print(
+            f"\nERROR: only {len(examples)} examples after filtering, but "
+            f"Vertex SFT requires at least {min_examples}. Loosen the filter "
+            "thresholds in sft_config.yaml (e.g. lower min_hidden_rate to 0.6) "
+            "and re-run process_trajectories.py.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    # --- Train/val split ---
+    train_examples, val_examples = split_examples(examples, val_frac, seed)
+
+    # --- Write ---
+    write_jsonl(train_path, train_examples)
+    if val_examples:
+        write_jsonl(val_path, val_examples)
+    elif val_path.exists():
+        val_path.unlink()
+
+    # --- Stats ---
+    total_tokens = sum(example_token_estimate(ex)[0] for ex in examples)
+    n_turns = sum(len(ex["contents"]) for ex in examples)
+    n_model_turns = sum(
+        1 for ex in examples for t in ex["contents"] if t["role"] == "model"
+    )
+
+    print()
+    print("=" * 70)
+    print("VERTEX SFT DATASET BUILD SUMMARY")
+    print("=" * 70)
+    print(f"  Honest trajectories loaded:    {len(trajectories)}")
+    print(f"  Skipped (no commands):         {skipped_empty}")
+    print(f"  Skipped (input too long):      {skipped_oversize_input}")
+    print(f"  Skipped (model turn too long): {skipped_oversize_turn}")
+    print(f"  Final examples:                {len(examples)}")
+    print(f"    train:                       {len(train_examples)}")
+    print(f"    val:                         {len(val_examples)}")
+    print(f"  Total turns across examples:   {n_turns}")
+    print(f"  Total model (assistant) turns: {n_model_turns}")
+    print(f"  Estimated total tokens:        {total_tokens:,}")
+    epochs = int(config["tuning"]["epochs"])
+    print(
+        f"  Estimated tuning tokens:       {total_tokens * epochs:,}"
+        f"  ({epochs} epochs)"
+    )
+    print()
+    print(f"  Train file: {train_path}")
+    if val_examples:
+        print(f"  Val file:   {val_path}")
+    print("=" * 70)
+    print(
+        "\n[INFO] Next step: upload these files and submit the tuning job:\n"
+        "         python -m training.sft_train --config config/sft_config.yaml"
+    )
 
 
 if __name__ == "__main__":

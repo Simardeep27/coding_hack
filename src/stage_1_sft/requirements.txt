@@ -1,34 +1,28 @@
 # ============================================================================
-# Phase 2, Step 1: SFT Warm Start -- Pinned Dependencies
+# Phase 2, Step 1: SFT Warm Start (Vertex AI Supervised Tuning)
 # ============================================================================
 # Install with:  pip install -r requirements.txt
 # Or with uv:    uv pip install -r requirements.txt
+#
+# No GPU stack: training runs on Google's hardware via Vertex AI's hosted SFT.
+# Your laptop only submits jobs and polls. Inference uses LiteLLM (already
+# pulled in by mini-swe-agent).
 # ============================================================================
 
-# Core ML framework
-torch>=2.1.0
+# Vertex AI SDK (supervised tuning + tuned-endpoint inference)
+google-cloud-aiplatform>=1.71.0
 
-# HuggingFace ecosystem
-transformers>=4.45.0
+# GCS (upload tuning dataset)
+google-cloud-storage>=2.18.0
+
+# Newer unified Gen AI SDK (used for token counting)
+google-genai>=1.18.0
+
+# SWE-bench Lite problem statement loading
 datasets>=3.0.0
-accelerate>=1.0.0
-tokenizers>=0.20.0
 
-# Parameter-efficient fine-tuning
-peft>=0.13.0
-
-# Reinforcement Learning from Human Feedback trainer
-trl>=0.12.0
-
-# 4-bit quantization for memory-efficient training
-bitsandbytes>=0.44.0
-
-# Configuration
+# Config
 pyyaml>=6.0
 
-# Logging and monitoring
-tensorboard>=2.15.0
-
-# Tokenizer dependencies (needed by some models)
-sentencepiece>=0.2.0
-protobuf>=4.25.0
+# Optional: for nicer CLI output
+tqdm>=4.66.0
