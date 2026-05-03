@@ -382,6 +382,7 @@ def main():
         # config can override (e.g. adamw_torch on hosts without bitsandbytes).
         optim=str(train_cfg.get("optim", "paged_adamw_8bit")),
         # Helps with very small datasets on a single GPU.
+        dataloader_num_workers=0,
         dataloader_pin_memory=False,
         # Make stdout deterministic across DDP / no DDP.
         disable_tqdm=False,
