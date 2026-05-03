@@ -55,7 +55,6 @@ subprocess.run(
      "accelerate>=1.0.0",
      "tokenizers>=0.20.0",
      "peft>=0.13.0",
-     "trl>=0.12.0",
      "bitsandbytes>=0.44.0",
      "pyyaml>=6.0",
      "tensorboard>=2.15.0",

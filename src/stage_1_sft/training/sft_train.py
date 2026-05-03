@@ -1,4 +1,3 @@
-from trl import SFTTrainer, SFTConfig, DataCollatorForCompletionOnlyLM
 #!/usr/bin/env python3
 """
 Phase 2, Step 1: SFT Training with LoRA
@@ -16,12 +15,15 @@ By training EXCLUSIVELY on trajectories that are:
 We ensure the policy begins from a non-exploitative prior, making the
 subsequent RL phase more stable and less prone to discovering reward hacks.
 
-Architecture decisions:
-    - LoRA:                   Fits on 24GB GPU, preserves base model capabilities
-    - 4-bit quantization:     Further memory reduction via bitsandbytes NF4
-    - Gradient checkpointing: Trades compute for memory
-    - Completion-only loss:   Only learns to generate agent actions
-    - No packing:             Clean trajectory boundaries, no cross-contamination
+Implementation notes:
+    The dataset built by ``data/build_sft_dataset.py`` already contains
+    ``input_ids``, ``attention_mask``, and ``labels`` (with ``-100`` on every
+    non-assistant token). We therefore train with plain
+    ``transformers.Trainer`` + ``DataCollatorForSeq2Seq`` rather than
+    ``trl.SFTTrainer`` -- this sidesteps the moving target of the trl API
+    (``DataCollatorForCompletionOnlyLM`` was removed in trl >= 0.20,
+    ``tokenizer`` was renamed to ``processing_class``, ``max_seq_length``
+    moved into ``SFTConfig``, etc.).
 
 Usage:
     # Dry run (10 steps, verify pipeline works)
@@ -36,7 +38,6 @@ Usage:
 
 import argparse
 import json
-import sys
 from pathlib import Path
 
 import yaml
@@ -46,9 +47,14 @@ from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     BitsAndBytesConfig,
+    DataCollatorForSeq2Seq,
+    Trainer,
+    TrainingArguments,
 )
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, TaskType
-from trl import SFTTrainer, SFTConfig, DataCollatorForCompletionOnlyLM
+
+
+KEEP_COLUMNS = ("input_ids", "attention_mask", "labels")
 
 
 def load_config(config_path: str = "config/sft_config.yaml") -> dict:
@@ -57,21 +63,54 @@ def load_config(config_path: str = "config/sft_config.yaml") -> dict:
         return yaml.safe_load(f)
 
 
+def detect_precision(train_cfg: dict) -> tuple[bool, bool]:
+    """
+    Pick a numerically-safe (bf16, fp16) pair for the current device.
+
+    Config defaults to bf16, but T4 / V100 / P100 do not support native bf16
+    and silently fall back to slow software emulation (or fail outright in
+    bitsandbytes 4-bit kernels). Detect the device and downgrade to fp16
+    when bf16 is unsupported.
+
+    Args:
+        train_cfg: Training section of the YAML config.
+
+    Returns:
+        (use_bf16, use_fp16) -- exactly one is True when CUDA is available;
+        both are False on CPU-only hosts (Trainer handles fp32 in that case).
+    """
+    want_bf16 = bool(train_cfg.get("bf16", True))
+    want_fp16 = bool(train_cfg.get("fp16", False))
+
+    if not torch.cuda.is_available():
+        # CPU-only smoke tests: disable both, let Trainer use fp32.
+        return False, False
+
+    bf16_supported = torch.cuda.is_bf16_supported()
+    if want_bf16 and bf16_supported:
+        return True, False
+    if want_bf16 and not bf16_supported:
+        print(
+            "[INFO] CUDA device does not support bf16 (likely T4/V100/P100). "
+            "Falling back to fp16."
+        )
+        return False, True
+    if want_fp16:
+        return False, True
+    # User explicitly disabled both: still safer to use fp16 on consumer GPUs
+    # if bf16 is unsupported, otherwise honour the user's request.
+    return False, not bf16_supported
+
+
 def setup_model_and_tokenizer(config: dict) -> tuple:
     """
     Load the base model with optional 4-bit quantization, ready for LoRA.
 
-    Model choice rationale:
-        We use an instruction-tuned code model (default: Qwen2.5-Coder-7B-Instruct)
-        that already has strong code understanding and instruction following.
-        The SFT phase adapts it to the specific agent action format and honest
-        problem-solving patterns without destroying its general capabilities.
-
-    Memory strategy for 24GB VRAM:
-        - BF16 base: ~14GB for 7B model
-        - 4-bit NF4:  ~4GB for 7B model (with double quantization)
-        - LoRA adapters: ~100-200MB additional
-        - Gradient checkpointing: reduces activation memory 60-70%
+    Memory strategy for 16 GB VRAM (Colab/Kaggle T4):
+        - 4-bit NF4:               ~5 GB for the 7B base model
+        - LoRA adapters:           ~25 MB additional (r=16, attn-only)
+        - Gradient checkpointing:  reduces activation memory ~60%
+        - Sequence length 4096:    final activations fit comfortably in <12 GB
 
     Args:
         config: Configuration dictionary with model and quantization settings.
@@ -91,31 +130,50 @@ def setup_model_and_tokenizer(config: dict) -> tuple:
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    # --- Load model with optional quantization ---
-    model_kwargs = {
+    # Right-padding is what causal LM training expects (BOS-anchored sequences).
+    tokenizer.padding_side = "right"
+
+    # --- Choose compute dtypes -------------------------------------------------
+    bf16_supported = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+    compute_dtype = torch.bfloat16 if bf16_supported else torch.float16
+
+    model_kwargs: dict = {
         "trust_remote_code": True,
-        "torch_dtype": torch.bfloat16,
+        "torch_dtype": compute_dtype,
     }
 
     if use_4bit:
         bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_compute_dtype=compute_dtype,
             bnb_4bit_use_double_quant=True,
         )
         model_kwargs["quantization_config"] = bnb_config
-        print("[INFO] Using NF4 quantization with double quantization")
+        print(
+            f"[INFO] NF4 + double-quant; compute_dtype="
+            f"{'bfloat16' if bf16_supported else 'float16'}"
+        )
 
     model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
 
-    if use_4bit:
-        model = prepare_model_for_kbit_training(model)
+    # Disable cache: incompatible with gradient checkpointing during training.
+    model.config.use_cache = False
 
-    # Enable gradient checkpointing for memory savings
-    if config["training"].get("gradient_checkpointing", True):
-        model.gradient_checkpointing_enable()
-        print("[INFO] Gradient checkpointing enabled")
+    if use_4bit:
+        # Prepare for k-bit training. We let TrainingArguments enable
+        # gradient_checkpointing later (single source of truth) so we pass
+        # use_gradient_checkpointing=False here.
+        model = prepare_model_for_kbit_training(
+            model, use_gradient_checkpointing=False
+        )
+
+    # When LoRA + gradient checkpointing without 4-bit, we still need to
+    # ensure the input embedding outputs require grad so backprop reaches
+    # the adapters. prepare_model_for_kbit_training does this for 4-bit;
+    # do it manually for the non-4-bit path.
+    if not use_4bit and hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
 
     param_count = sum(p.numel() for p in model.parameters())
     print(f"[INFO] Model parameters: {param_count / 1e6:.1f}M")
@@ -130,57 +188,30 @@ def setup_lora(model, config: dict):
     LoRA adds small trainable rank-decomposition matrices to the attention
     layers. With r=16 and targeting q/k/v/o projections, we add ~0.5% new
     trainable parameters while keeping 99.5% of the model frozen.
-
-    Benefits for the integrity-aware RL pipeline:
-        1. Memory: Fits 7B model training on a single 24GB GPU
-        2. Preservation: Base model capabilities are maintained
-        3. Modularity: Easy to merge/swap adapters for evaluation
-        4. Speed: Training is faster with fewer gradient computations
-        5. RL readiness: Same adapter approach works for Phase 2 PPO/DPO
-
-    Args:
-        model:  Base language model (optionally quantized).
-        config: Configuration with LoRA hyperparameters.
-
-    Returns:
-        PEFT model with LoRA adapters attached.
     """
     lora_cfg = config["lora"]
 
     lora_config = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
-        r=lora_cfg["r"],                          # Rank: 16
-        lora_alpha=lora_cfg["alpha"],              # Alpha: 32 (scaling = alpha/r = 2)
-        lora_dropout=lora_cfg["dropout"],          # Dropout: 0.05
-        target_modules=lora_cfg["target_modules"], # q_proj, k_proj, v_proj, o_proj
-        bias="none",                               # Don't train biases
+        r=lora_cfg["r"],
+        lora_alpha=lora_cfg["alpha"],
+        lora_dropout=lora_cfg["dropout"],
+        target_modules=lora_cfg["target_modules"],
+        bias="none",
     )
 
     model = get_peft_model(model, lora_config)
-
-    # Print trainable parameter summary
     model.print_trainable_parameters()
-
     return model
 
 
 def verify_dataset_safety(dataset) -> None:
     """
-    Final safety verification before training begins.
+    Final structural verification before training begins.
 
-    This is the LAST line of defense against accidentally training on
-    reward-hacking trajectories. Runs before any gradient computation.
-
-    Checks:
-        - Dataset is non-empty
-        - Required fields are present
-        - Sample format is correct
-
-    Note: The per-trajectory is_reward_hack assertion was already run in
-    build_sft_dataset.py. This provides a structural check.
-
-    Raises:
-        AssertionError: If dataset is empty or missing required fields.
+    The per-row is_reward_hack assertion already runs in build_sft_dataset.py
+    (which derives this dataset). Here we only confirm the on-disk artifact
+    is non-empty and has the columns Trainer expects.
     """
     print("[INFO] Running final safety verification on training dataset...")
 
@@ -189,67 +220,45 @@ def verify_dataset_safety(dataset) -> None:
         "No honest trajectories to train on. Aborting."
     )
 
-    # Verify expected fields exist in the first example
+    missing = [c for c in KEEP_COLUMNS if c not in dataset.column_names]
+    assert not missing, (
+        f"SAFETY CHECK FAILED: Dataset is missing required columns: {missing}. "
+        f"Re-run data/build_sft_dataset.py to regenerate."
+    )
+
+    # Spot-check that at least one assistant token survives in the labels.
     sample = dataset[0]
-    assert "messages" in sample or "input_ids" in sample, (
-        "SAFETY CHECK FAILED: Dataset missing required fields "
-        "(expected 'messages' or 'input_ids'). Aborting."
+    n_kept = sum(1 for t in sample["labels"] if t != -100)
+    assert n_kept > 0, (
+        "SAFETY CHECK FAILED: First example has zero non-masked label tokens. "
+        "Loss masking would be all-ignored. Aborting."
     )
 
     print(
         f"[INFO] Safety verification PASSED: "
-        f"{len(dataset)} clean examples ready for training"
+        f"{len(dataset)} examples; sample assistant tokens = {n_kept}"
     )
 
 
-def create_formatting_func(tokenizer):
+def prepare_dataset_columns(dataset):
     """
-    Create a formatting function for SFTTrainer.
+    Drop everything except input_ids/attention_mask/labels.
 
-    Converts the messages list in each example to the model's chat template
-    format. Using the model's native chat template ensures compatibility
-    with the instruction-following format learned during pre-training.
-
-    For Qwen2.5 models, this produces:
-        <|im_start|>system
-        ...
-        <|im_end|>
-        <|im_start|>user
-        ...
-        <|im_end|>
-        <|im_start|>assistant
-        ...
-        <|im_end|>
-
-    Args:
-        tokenizer: HuggingFace tokenizer with chat template support.
-
-    Returns:
-        Formatting function compatible with SFTTrainer.
+    Auxiliary columns (instance_id, messages) trip up the default Trainer
+    collator path because they're either nested lists or non-tensor strings.
+    Keeping the dataset narrow avoids any silent re-tokenization or column
+    mishandling.
     """
-
-    def formatting_func(example):
-        messages = example["messages"]
-        text = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=False
-        )
-        return text
-
-    return formatting_func
+    drop = [c for c in dataset.column_names if c not in KEEP_COLUMNS]
+    if drop:
+        print(f"[INFO] Dropping non-tensor columns from dataset: {drop}")
+        dataset = dataset.remove_columns(drop)
+    return dataset
 
 
 def main():
     """
     Main entry point: setup, verify, train, and save the SFT warm-started model.
-
-    Training pipeline:
-        1. Load config and dataset
-        2. Run safety verification (no reward hacks in data)
-        3. Load base model with optional 4-bit quantization
-        4. Attach LoRA adapters
-        5. Configure completion-only loss masking
-        6. Train with SFTTrainer
-        7. Save final checkpoint with metadata
     """
     parser = argparse.ArgumentParser(
         description="SFT training for integrity-aware RL warm start"
@@ -285,8 +294,9 @@ def main():
     dataset = load_from_disk(dataset_dir)
     print(f"[INFO] Dataset size: {len(dataset)} examples")
 
-    # --- Safety verification ---
+    # --- Safety verification + column trimming ---
     verify_dataset_safety(dataset)
+    dataset = prepare_dataset_columns(dataset)
 
     # --- Setup model and LoRA ---
     model, tokenizer = setup_model_and_tokenizer(config)
@@ -308,21 +318,23 @@ def main():
         print("* DRY RUN MODE: Running 10 steps only")
         print("*" * 50 + "\n")
 
-    # --- Data collator for completion-only loss masking ---
-    # This ensures loss is ONLY computed on assistant responses.
-    # For Qwen2.5 models, the assistant turn starts with "<|im_start|>assistant\n"
-    # and user turns start with "<|im_start|>user\n".
-    response_template = "<|im_start|>assistant\n"
-    instruction_template = "<|im_start|>user\n"
-
-    collator = DataCollatorForCompletionOnlyLM(
-        response_template=response_template,
-        instruction_template=instruction_template,
+    # --- Data collator ---
+    # DataCollatorForSeq2Seq pads input_ids/attention_mask to the longest in
+    # the batch and pads labels with -100 (so padded positions are ignored
+    # by the loss). Works perfectly for our pre-tokenized causal LM data.
+    collator = DataCollatorForSeq2Seq(
         tokenizer=tokenizer,
+        padding="longest",
+        label_pad_token_id=-100,
+        pad_to_multiple_of=8,  # tensor-core friendly
+        return_tensors="pt",
     )
 
+    # --- Precision selection (T4-safe) ---
+    use_bf16, use_fp16 = detect_precision(train_cfg)
+
     # --- Training arguments ---
-    training_args = SFTConfig(
+    training_args = TrainingArguments(
         output_dir=output_dir,
         num_train_epochs=num_epochs,
         max_steps=max_steps,
@@ -330,28 +342,33 @@ def main():
         gradient_accumulation_steps=train_cfg["gradient_accumulation_steps"],
         learning_rate=train_cfg["learning_rate"],
         warmup_ratio=train_cfg["warmup_ratio"],
-        bf16=train_cfg["bf16"],
-        gradient_checkpointing=train_cfg["gradient_checkpointing"],
+        bf16=use_bf16,
+        fp16=use_fp16,
+        gradient_checkpointing=bool(train_cfg.get("gradient_checkpointing", True)),
+        # PEFT models need this to avoid a re-entrant autograd warning when
+        # gradient_checkpointing is enabled.
+        gradient_checkpointing_kwargs={"use_reentrant": False},
         logging_dir=logging_dir,
         logging_steps=train_cfg["logging_steps"],
         save_steps=train_cfg["save_steps"],
         save_total_limit=3,
-        report_to="tensorboard",
-        packing=train_cfg.get("packing", False),
-        max_seq_length=config["model"]["max_length"],
-        dataset_text_field=None,
+        save_strategy="steps",
+        report_to=["tensorboard"],
+        # We pass already-tokenized examples; do not let Trainer drop them.
         remove_unused_columns=False,
+        # Avoid Apex/Triton optimisations that don't exist on T4.
+        optim="adamw_torch",
+        # Helps with very small datasets on a single GPU.
+        dataloader_pin_memory=False,
+        # Make stdout deterministic across DDP / no DDP.
+        disable_tqdm=False,
     )
 
-    # --- Create formatting function ---
-    formatting_func = create_formatting_func(tokenizer)
-
-    # --- Initialize SFTTrainer ---
-    trainer = SFTTrainer(
+    # --- Initialize Trainer ---
+    trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=dataset,
-        formatting_func=formatting_func,
         data_collator=collator,
         tokenizer=tokenizer,
     )
@@ -369,6 +386,7 @@ def main():
     print("=" * 70)
     print(f"  Model:              {config['model']['name']}")
     print(f"  4-bit quantization: {config['model'].get('use_4bit', False)}")
+    print(f"  Precision:          bf16={use_bf16}  fp16={use_fp16}")
     print(f"  LoRA r / alpha:     {config['lora']['r']} / {config['lora']['alpha']}")
     print(f"  Target modules:     {config['lora']['target_modules']}")
     print(f"  Learning rate:      {train_cfg['learning_rate']}")
@@ -389,7 +407,7 @@ def main():
     print("[INFO] Starting SFT training...")
     train_result = trainer.train()
 
-    # --- Save final model ---
+    # --- Save final model (LoRA adapter + tokenizer) ---
     final_dir = Path(output_dir) / "final"
     final_dir.mkdir(parents=True, exist_ok=True)
     trainer.save_model(str(final_dir))
@@ -414,6 +432,7 @@ def main():
         "total_steps": train_result.global_step,
         "final_loss": train_result.training_loss,
         "dry_run": args.dry_run,
+        "precision": {"bf16": use_bf16, "fp16": use_fp16},
         "lora_config": config["lora"],
         "training_config": {
             k: v

@@ -17,10 +17,8 @@ tokenizers>=0.20.0
 # Parameter-efficient fine-tuning
 peft>=0.13.0
 
-# Reinforcement Learning from Human Feedback trainer
-trl>=0.12.0
-
 # 4-bit quantization for memory-efficient training
+# (T4/V100/P100 supported on bitsandbytes>=0.43; T4 is the Colab/Kaggle target.)
 bitsandbytes>=0.44.0
 
 # Configuration
