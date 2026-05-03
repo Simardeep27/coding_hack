@@ -8,11 +8,17 @@
 
 # --- Model Configuration ---
 # Qwen2.5-Coder-7B-Instruct is the canonical 7B instruct model from the Qwen
-# team for code. It fits Colab T4 (16 GB) and Kaggle P100/T4 with 4-bit QLoRA
-# (max_length 4096) and is comfortable on a Colab Pro A100 40 GB at 8192.
+# team for code. With NF4 + LoRA + grad checkpointing on a T4 16 GB, the
+# realistic sequence-length budget is 2048; 4096 OOMs at the first backward
+# step (activations alone push past ~14 GB).
 model:
   name: "Qwen/Qwen2.5-Coder-7B-Instruct"
-  max_length: 4096    # Use 4096 on T4/P100 (16 GB); 8192 on A100 (40 GB+)
+  # Sequence length budget per GPU class:
+  #   T4 16 GB   (Colab free, Kaggle T4)  -> 2048
+  #   P100 16 GB (Kaggle)                 -> 2048
+  #   V100 16 GB / T4 x2                  -> 3072
+  #   A100 40 GB+                         -> 8192
+  max_length: 2048
   use_4bit: true      # Enable 4-bit quantization for 16 GB VRAM target
 
 # --- LoRA Configuration ---
@@ -41,6 +47,10 @@ training:
   logging_steps: 10
   save_steps: 100
   packing: false          # Clean trajectory boundaries, no packing
+  # paged_adamw_8bit: bitsandbytes 8-bit Adam with CPU paging; ~700 MB
+  # smaller optimizer state vs adamw_torch and avoids fragmentation OOMs
+  # on T4. Falls back to adamw_torch automatically if bnb is unavailable.
+  optim: "paged_adamw_8bit"
   output_dir: "checkpoints/sft_warmstart"
   logging_dir: "logs/sft_warmstart"
 

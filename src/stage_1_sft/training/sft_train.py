@@ -39,7 +39,12 @@ Usage:
 import argparse
 import inspect
 import json
+import os
 from pathlib import Path
+
+# Reduce CUDA fragmentation OOMs on small GPUs (T4/P100). Must be set before
+# torch's CUDA caching allocator initialises, hence import order matters.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import yaml
 import torch
