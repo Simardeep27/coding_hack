@@ -1,139 +1,97 @@
 """
 Colab driver for the SFT warm-start pipeline (Qwen2.5-Coder-7B-Instruct).
 
-How to use:
-    1. Open https://colab.research.google.com and start a fresh notebook.
-    2. Runtime -> Change runtime type -> Hardware accelerator: T4 GPU
-       (or A100 if you have Colab Pro+; T4 16 GB is the supported budget here).
-    3. Copy the cells below into the notebook in order, or upload this file
-       and run `!python colab_sft_qwen7b.py` after providing the trajectories
-       at /content/coding_hack/src/stage_1_sft/data/.
-    4. Generation/eval against the SWE-bench harness CANNOT run on Colab
-       (no Docker). After training, download
-       checkpoints/sft_warmstart/final/ and run eval_sft.py on a Linux box
-       with Docker. Use `--predictions-only` here if you only want to dry-run
-       the agent loop (no hidden_rate/visible_rate).
+How to use
+==========
+1. Open https://colab.research.google.com, then Runtime -> Change runtime
+   type -> Hardware accelerator: T4 GPU.
+2. Edit REPO_URL in CELL 1 to point at your fork.
+3. Copy each CELL block below into its OWN Colab cell, in order. Each cell
+   starts at column 0 -- copy from the line that begins the cell, not from
+   inside it, otherwise Jupyter will throw IndentationError.
+4. Real eval (mini-SWE-agent + SWE-bench harness) cannot run on Colab
+   (no Docker). After training, the final cell copies the LoRA adapter to
+   Google Drive so you can download it and run eval_sft.py on a Linux box
+   with Docker.
 
-The script is also valid as a single .py invocation; each block is a clear,
-copy-pasteable cell.
+Why `!` magic + `python -u`
+---------------------------
+- `!cmd` streams the child's stdout straight into the cell. No buffering.
+- `python -u` disables Python's stdout buffering inside the child too,
+  so `[INFO]` lines and `tqdm` bars appear live.
+
+This file is documentation: the cells are inert triple-quoted strings.
+Open it in the editor, paste each block into Colab, and run.
 """
 
-# =============================================================================
-# CELL 1 -- Repo + deps
-# =============================================================================
-import os, subprocess, sys
+CELL_1_CLONE = r"""
+REPO_URL = "https://github.com/Simardeep27/coding_hack.git"
+BRANCH   = "smitha_patch"
+!rm -rf /content/coding_hack
+!git clone --depth 1 -b $BRANCH $REPO_URL /content/coding_hack
+%cd /content/coding_hack
+"""
 
-REPO_URL = os.environ.get("REPO_URL", "https://github.com/<your-user>/coding_hack.git")
-REPO_DIR = "/content/coding_hack"
-BRANCH   = os.environ.get("BRANCH", "smitha_patch")
+CELL_2_DEPS = r"""
+!pip install torch>=2.1.0 "transformers>=4.45.0" "datasets>=3.0.0" "accelerate>=1.0.0" "tokenizers>=0.20.0" "peft>=0.13.0" "bitsandbytes>=0.44.0" "pyyaml>=6.0" "tensorboard>=2.15.0" "sentencepiece>=0.2.0" "protobuf>=4.25.0"
+!pip install -e /content/coding_hack
+"""
 
-if not os.path.isdir(REPO_DIR):
-    subprocess.run(["git", "clone", "--depth", "1", "-b", BRANCH, REPO_URL, REPO_DIR], check=True)
-os.chdir(REPO_DIR)
-print("CWD:", os.getcwd())
-
-# Install pinned deps. bitsandbytes is needed for 4-bit QLoRA on a T4.
-subprocess.run(
-    [sys.executable, "-m", "pip", "install", "-q",
-     "torch>=2.1.0",
-     "transformers>=4.45.0",
-     "datasets>=3.0.0",
-     "accelerate>=1.0.0",
-     "tokenizers>=0.20.0",
-     "peft>=0.13.0",
-     "bitsandbytes>=0.44.0",
-     "pyyaml>=6.0",
-     "tensorboard>=2.15.0",
-     "sentencepiece>=0.2.0",
-     "protobuf>=4.25.0"],
-    check=True,
-)
-# Also install the local benchmark_agents package so the eval CLI is on PATH.
-subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-e", REPO_DIR], check=True)
-
-# =============================================================================
-# CELL 2 -- Trajectory inputs
-# =============================================================================
-# Either the trajectory files were committed to the repo (default), or you
-# upload them via the Colab Files panel into:
-#   /content/coding_hack/src/stage_1_sft/data/trajectories.jsonl
-#   /content/coding_hack/src/stage_1_sft/data/trajectories2.jsonl
-DATA_DIR = os.path.join(REPO_DIR, "src/stage_1_sft/data")
+CELL_3_CHECK_INPUTS = r"""
+import os
+DATA_DIR = "/content/coding_hack/src/stage_1_sft/data"
 for f in ["trajectories.jsonl", "trajectories2.jsonl"]:
     p = os.path.join(DATA_DIR, f)
-    if not os.path.exists(p):
-        raise FileNotFoundError(
-            f"Missing {p}. Upload it via the Colab Files panel before continuing."
-        )
-print("Trajectories present.")
+    assert os.path.exists(p), f"Missing {p} -- upload via the Files panel"
+print("OK")
+"""
 
-# =============================================================================
-# CELL 3 -- Merge + filter + split
-# =============================================================================
-os.chdir(os.path.join(REPO_DIR, "src/stage_1_sft"))
-subprocess.run(
-    [sys.executable, "-m", "data.merge_trajectories", "--config", "config/sft_config.yaml"],
-    check=True,
-)
-subprocess.run(
-    [sys.executable, "-m", "data.process_trajectories", "--config", "config/sft_config.yaml"],
-    check=True,
-)
+CELL_4_MERGE_PROCESS = r"""
+%cd /content/coding_hack/src/stage_1_sft
+!python -u -m data.merge_trajectories  --config config/sft_config.yaml
+!python -u -m data.process_trajectories --config config/sft_config.yaml
+"""
 
-# =============================================================================
-# CELL 4 -- Tokenize (use 4096 max-length on T4)
-# =============================================================================
-subprocess.run(
-    [sys.executable, "-m", "data.build_sft_dataset",
-     "--config", "config/sft_config.yaml", "--max_length", "4096"],
-    check=True,
-)
+CELL_5_TOKENIZE = r"""
+!python -u -m data.build_sft_dataset --config config/sft_config.yaml --max_length 4096
+"""
 
-# =============================================================================
-# CELL 5 -- Train (LoRA + 4-bit QLoRA)
-# =============================================================================
-# T4 / 16 GB: keep per_device_train_batch_size=1, gradient_accumulation_steps=8,
-# max_length=4096. The default config matches.
-# Set DRY_RUN=1 in env for a 10-step smoke test before the full run.
-extra = ["--dry_run"] if os.environ.get("DRY_RUN") == "1" else []
-subprocess.run(
-    [sys.executable, "-m", "training.sft_train",
-     "--config", "config/sft_config.yaml", *extra],
-    check=True,
-)
+CELL_6_DRY_RUN = r"""
+!rm -rf checkpoints/sft_warmstart
+!python -u -m training.sft_train --config config/sft_config.yaml --dry_run
+"""
 
-# =============================================================================
-# CELL 6 -- Save the adapter to Drive (optional)
-# =============================================================================
-# Mount Drive and persist the LoRA adapter so you can download it for eval
-# on a Docker-equipped box.
-try:
-    from google.colab import drive   # type: ignore
-    drive.mount("/content/drive")
-    import shutil
-    src = os.path.join(REPO_DIR, "src/stage_1_sft/checkpoints/sft_warmstart/final")
-    dst = "/content/drive/MyDrive/sft_warmstart_final"
-    if os.path.exists(dst):
-        shutil.rmtree(dst)
-    shutil.copytree(src, dst)
-    print(f"Adapter copied to: {dst}")
-except Exception as e:
-    print(f"[skip] Drive copy unavailable: {e}")
+CELL_7_FULL_TRAIN = r"""
+!python -u -m training.sft_train --config config/sft_config.yaml
+"""
 
-# =============================================================================
-# CELL 7 -- (Optional) predictions-only dry run on Colab
-# =============================================================================
-# Real eval requires Docker (mini-SWE-agent + SWE-bench harness). Colab does
-# not provide Docker, so the harness step is unavailable. The block below
-# only generates predictions for inspection; it does NOT compute hidden_rate
-# / visible_rate. Use a Linux+Docker box for the full eval.
-SKIP_PREDICTIONS = os.environ.get("SKIP_PREDICTIONS", "1") == "1"
-if not SKIP_PREDICTIONS:
-    print("WARNING: predictions-only mode -- hidden/visible rates will be unavailable.")
-    subprocess.run(
-        [sys.executable, "-m", "evaluation.eval_sft",
-         "--config", "config/sft_config.yaml",
-         "--predictions-only"],
-        check=False,
-    )
-print("Done. Download the adapter (or read from Drive) and run real eval on a Docker host.")
+CELL_8_SAVE_TO_DRIVE = r"""
+from google.colab import drive
+drive.mount("/content/drive")
+import shutil, os
+src = "/content/coding_hack/src/stage_1_sft/checkpoints/sft_warmstart/final"
+dst = "/content/drive/MyDrive/sft_warmstart_final"
+if os.path.exists(dst):
+    shutil.rmtree(dst)
+shutil.copytree(src, dst)
+print("Saved:", dst)
+"""
+
+
+if __name__ == "__main__":
+    cells = [
+        ("CELL 1 -- Clone repo (edit REPO_URL!)", CELL_1_CLONE),
+        ("CELL 2 -- Install deps",                CELL_2_DEPS),
+        ("CELL 3 -- Verify trajectory inputs",    CELL_3_CHECK_INPUTS),
+        ("CELL 4 -- Merge + filter + split",      CELL_4_MERGE_PROCESS),
+        ("CELL 5 -- Tokenize SFT dataset",        CELL_5_TOKENIZE),
+        ("CELL 6 -- Wipe checkpoint + dry run",   CELL_6_DRY_RUN),
+        ("CELL 7 -- Full training",               CELL_7_FULL_TRAIN),
+        ("CELL 8 -- Save LoRA adapter to Drive",  CELL_8_SAVE_TO_DRIVE),
+    ]
+    for title, body in cells:
+        print("=" * 70)
+        print(title)
+        print("=" * 70)
+        print(body.strip())
+        print()

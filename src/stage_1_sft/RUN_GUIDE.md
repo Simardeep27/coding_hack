@@ -77,15 +77,16 @@ that one cell:
 import os, urllib.request
 
 # ---- EDIT THESE TWO LINES ----
-os.environ["REPO_URL"] = "https://github.com/<YOUR-USER>/coding_hack.git"
+os.environ["REPO_URL"] = "https://github.com/Simardeep27/coding_hack.git"
 os.environ["BRANCH"]   = "smitha_patch"
 # ------------------------------
 
 # Pull the driver script straight out of the repo and exec it.
-url = (os.environ["REPO_URL"]
-       .replace("github.com", "raw.githubusercontent.com")
-       .replace(".git", "")
-       + f"/{os.environ['BRANCH']}/src/stage_1_sft/notebooks/colab_sft_qwen7b.py")
+# Constructing the URL by strictly defining the parts to avoid replacement errors
+repo_path = os.environ["REPO_URL"].replace("https://github.com/", "").replace(".git", "")
+url = f"https://raw.githubusercontent.com/{repo_path}/{os.environ['BRANCH']}/src/stage_1_sft/notebooks/colab_sft_qwen7b.py"
+
+print(f"Fetching from: {url}")
 exec(urllib.request.urlopen(url).read())
 ```
 

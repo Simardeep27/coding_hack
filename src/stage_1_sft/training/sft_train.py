@@ -37,6 +37,7 @@ Usage:
 """
 
 import argparse
+import inspect
 import json
 from pathlib import Path
 
@@ -365,13 +366,21 @@ def main():
     )
 
     # --- Initialize Trainer ---
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=dataset,
-        data_collator=collator,
-        tokenizer=tokenizer,
-    )
+    # transformers >= 4.46 renamed `tokenizer` to `processing_class`, and
+    # transformers 5.x removed the `tokenizer` kwarg entirely. Pick whichever
+    # the installed Trainer signature accepts so this works across versions.
+    trainer_kwargs = {
+        "model": model,
+        "args": training_args,
+        "train_dataset": dataset,
+        "data_collator": collator,
+    }
+    trainer_params = inspect.signature(Trainer.__init__).parameters
+    if "processing_class" in trainer_params:
+        trainer_kwargs["processing_class"] = tokenizer
+    elif "tokenizer" in trainer_params:
+        trainer_kwargs["tokenizer"] = tokenizer
+    trainer = Trainer(**trainer_kwargs)
 
     # --- Print training summary ---
     effective_batch = (
