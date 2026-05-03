@@ -25,9 +25,11 @@ Usage:
 
 import json
 import argparse
+import math
+import random
 import sys
 from pathlib import Path
-from collections import Counter
+from collections import Counter, defaultdict
 from typing import Any
 
 import yaml
@@ -257,6 +259,98 @@ def is_honest_successful(
     return True, "passed"
 
 
+def stratified_train_eval_split(
+    rows: list[dict],
+    eval_fraction: float,
+    seed: int,
+    stratify_by_repo: bool,
+    min_eval_per_repo: int,
+) -> tuple[list[dict], list[dict]]:
+    """
+    Deterministically partition honest trajectories into train and eval.
+
+    Stratification is by SWE-bench repo prefix (the substring before "__" in
+    instance_id). This guarantees every repo present in the data is also
+    represented in the held-out eval set, which is important because Django
+    dominates SWE-bench Lite -- without stratification the eval set could
+    end up Django-only.
+
+    Args:
+        rows:               Filtered honest trajectories.
+        eval_fraction:      Target fraction in [0, 1] for the eval split.
+        seed:               RNG seed for reproducibility.
+        stratify_by_repo:   When True, sample per repo. When False, sample
+                            uniformly from the full pool.
+        min_eval_per_repo:  Minimum eval examples to take from each repo
+                            that has at least min_eval_per_repo + 1 rows.
+
+    Returns:
+        (train_rows, eval_rows) -- both lists are deterministic given seed.
+    """
+    if not rows:
+        return [], []
+    rng = random.Random(seed)
+
+    def repo_prefix(iid: str) -> str:
+        return (iid or "").split("__", 1)[0] or "unknown"
+
+    if not stratify_by_repo:
+        shuffled = rows[:]
+        rng.shuffle(shuffled)
+        n_eval = max(1, round(eval_fraction * len(shuffled)))
+        eval_rows = shuffled[:n_eval]
+        train_rows = shuffled[n_eval:]
+        return train_rows, eval_rows
+
+    by_repo: dict[str, list[dict]] = defaultdict(list)
+    for row in rows:
+        by_repo[repo_prefix(row.get("instance_id", ""))].append(row)
+
+    train_rows: list[dict] = []
+    eval_rows: list[dict] = []
+    for repo, items in sorted(by_repo.items()):
+        rng.shuffle(items)
+        n = len(items)
+        if n <= 1:
+            # Only one example for this repo: keep it in train. (Putting it
+            # in eval means the model never saw this repo at training time
+            # AND we can't measure generalization without overlap.)
+            train_rows.extend(items)
+            continue
+        target_eval = max(min_eval_per_repo, math.ceil(eval_fraction * n))
+        target_eval = min(target_eval, n - 1)  # leave at least 1 in train
+        eval_rows.extend(items[:target_eval])
+        train_rows.extend(items[target_eval:])
+
+    return train_rows, eval_rows
+
+
+def write_split_outputs(
+    train_rows: list[dict],
+    eval_rows: list[dict],
+    train_path: Path,
+    eval_path: Path,
+    eval_ids_path: Path,
+) -> None:
+    """Persist train/eval rows + a plain-text instance id list for mini-SWE."""
+    train_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(train_path, "w") as f:
+        for row in train_rows:
+            f.write(json.dumps(row) + "\n")
+
+    eval_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(eval_path, "w") as f:
+        for row in eval_rows:
+            f.write(json.dumps(row) + "\n")
+
+    eval_ids_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(eval_ids_path, "w") as f:
+        for row in eval_rows:
+            iid = row.get("instance_id", "").strip()
+            if iid:
+                f.write(iid + "\n")
+
+
 def print_summary(
     trajectories: list[dict],
     all_components: list[dict],
@@ -442,18 +536,57 @@ def main():
     # --- Print summary ---
     print_summary(trajectories, all_components, filtered, rejection_reasons)
 
-    # --- Save filtered trajectories ---
-    output_dir = Path(output_path).parent
-    output_dir.mkdir(parents=True, exist_ok=True)
+    # --- Stratified train / eval split ---
+    split_cfg = config.get("split") or {}
+    eval_fraction = float(split_cfg.get("eval_fraction", 0.2))
+    split_seed = int(split_cfg.get("seed", 42))
+    stratify_by_repo = bool(split_cfg.get("stratify_by_repo", True))
+    min_eval_per_repo = int(split_cfg.get("min_eval_per_repo", 1))
 
-    with open(output_path, "w") as f:
-        for traj in filtered:
-            f.write(json.dumps(traj) + "\n")
+    train_rows, eval_rows = stratified_train_eval_split(
+        filtered,
+        eval_fraction=eval_fraction,
+        seed=split_seed,
+        stratify_by_repo=stratify_by_repo,
+        min_eval_per_repo=min_eval_per_repo,
+    )
 
-    print(f"\n[INFO] Saved {len(filtered)} honest trajectories to {output_path}")
-    print(f"[INFO] These trajectories are ready for SFT dataset construction.")
+    eval_holdout_path = Path(
+        config["data"].get("eval_holdout_path", "data/sft_eval_trajectories.jsonl")
+    )
+    eval_ids_path = Path(
+        config["data"].get("eval_instance_ids_path", "data/sft_eval_instance_ids.txt")
+    )
 
-    return filtered
+    write_split_outputs(
+        train_rows=train_rows,
+        eval_rows=eval_rows,
+        train_path=Path(output_path),
+        eval_path=eval_holdout_path,
+        eval_ids_path=eval_ids_path,
+    )
+
+    # --- Split summary ---
+    def repo_dist(rows: list[dict]) -> Counter:
+        return Counter(
+            (r.get("instance_id", "") or "").split("__", 1)[0] for r in rows
+        )
+
+    print(f"\n--- Train / Eval Split ---")
+    print(f"  Eval fraction:     {eval_fraction}")
+    print(f"  Seed:              {split_seed}")
+    print(f"  Stratify by repo:  {stratify_by_repo}")
+    print(f"  Train rows:        {len(train_rows)}")
+    print(f"  Eval rows:         {len(eval_rows)}")
+    print(f"  Train repo dist:   {dict(repo_dist(train_rows).most_common())}")
+    print(f"  Eval  repo dist:   {dict(repo_dist(eval_rows).most_common())}")
+
+    print(f"\n[INFO] Saved {len(train_rows)} train trajectories to {output_path}")
+    print(f"[INFO] Saved {len(eval_rows)} held-out eval trajectories to {eval_holdout_path}")
+    print(f"[INFO] Saved eval instance ids to {eval_ids_path}")
+    print(f"[INFO] Train data is ready for SFT dataset construction.")
+
+    return train_rows
 
 
 if __name__ == "__main__":

@@ -475,8 +475,15 @@ def main():
     tokenizer_dir.mkdir(parents=True, exist_ok=True)
     tokenizer.save_pretrained(str(tokenizer_dir))
 
+    # Record which instance ids ended up in the tokenized training corpus so
+    # eval can assert disjointness from the held-out set.
+    train_ids = sorted({str(x) for x in dataset["instance_id"]})
+    train_ids_path = Path(output_dir) / "train_instance_ids.txt"
+    train_ids_path.write_text("\n".join(train_ids) + ("\n" if train_ids else ""))
+
     print(f"\n[INFO] Dataset saved to {output_dir}  ({len(dataset)} examples)")
     print(f"[INFO] Tokenizer saved to {tokenizer_dir}")
+    print(f"[INFO] Train instance ids saved to {train_ids_path}")
     print(f"[INFO] Ready for training: python -m training.sft_train")
 
 

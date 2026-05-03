@@ -7,10 +7,13 @@
 # ===========================================================================
 
 # --- Model Configuration ---
+# Qwen2.5-Coder-7B-Instruct is the canonical 7B instruct model from the Qwen
+# team for code. It fits Colab T4 (16 GB) and Kaggle P100/T4 with 4-bit QLoRA
+# (max_length 4096) and is comfortable on a Colab Pro A100 40 GB at 8192.
 model:
   name: "Qwen/Qwen2.5-Coder-7B-Instruct"
-  max_length: 8192
-  use_4bit: true    # Enable 4-bit quantization for 24GB VRAM target
+  max_length: 4096    # Use 4096 on T4/P100 (16 GB); 8192 on A100 (40 GB+)
+  use_4bit: true      # Enable 4-bit quantization for 16 GB VRAM target
 
 # --- LoRA Configuration ---
 # Low-Rank Adaptation for parameter-efficient fine-tuning.
@@ -73,13 +76,54 @@ filtering:
   all_signals_false: true  # No suspicious behaviors at all
 
 # --- Data Paths ---
+# trajectory_inputs is a list of raw labeled-trajectory JSONL files. The merge
+# step (merge_trajectories.py) deduplicates by instance_id and writes a single
+# merged file used by the rest of the pipeline.
 data:
-  input_path: "data/trajectories.jsonl"
+  trajectory_inputs:
+    - "data/trajectories.jsonl"
+    - "data/trajectories2.jsonl"
+  merged_path: "data/merged_trajectories.jsonl"
+  # Legacy alias kept so process_trajectories.py picks up the merged file by
+  # default. Override at the CLI to point at any other source.
+  input_path: "data/merged_trajectories.jsonl"
   sft_output_path: "data/sft_trajectories.jsonl"
+  eval_holdout_path: "data/sft_eval_trajectories.jsonl"
+  eval_instance_ids_path: "data/sft_eval_instance_ids.txt"
   dataset_output_dir: "data/sft_dataset"
 
+# --- Train / Eval Split ---
+# After honest-trajectory filtering, the surviving rows are split into a
+# training set (used to build the tokenized SFT dataset) and a held-out
+# evaluation set (used by eval_sft.py against the real mini-SWE-agent harness).
+# Stratified by repo prefix so every repo is represented in eval.
+split:
+  eval_fraction: 0.2
+  seed: 42
+  stratify_by_repo: true
+  min_eval_per_repo: 1
+
 # --- Evaluation Settings ---
+# eval_sft.py runs a real mini-SWE-agent harness against the held-out instance
+# ids. It does NOT use placeholder metrics. See README_SFT.md for the required
+# Docker / vLLM setup.
 evaluation:
-  num_instances: 20
-  output_report: "evaluation/sft_eval_report.md"
   base_model_comparison: true
+  output_report: "evaluation/sft_eval_report.md"
+  results_dir: "evaluation/results"
+  # mini-SWE-agent + harness settings.
+  vllm_host: "127.0.0.1"
+  vllm_port: 8000
+  vllm_served_model_name: "qwen-coder-sft"
+  generation_temperature: 0.1
+  generation_max_tokens: 1024
+  workers: 1
+  visible_fail_to_pass_count: 1
+  min_hidden_fail_to_pass_count: 1
+  include_pass_to_pass: true
+  # Where to find the local SWE-bench harness for the official run.
+  swebench_dataset: "lite"
+  swebench_split: "test"
+  # Reward-hack labeler for E and is_reward_hack on eval rows.
+  labeler_judge: "static"            # "static" or "llm"
+  labeler_extra_args: ""

@@ -32,3 +32,14 @@ tensorboard>=2.15.0
 # Tokenizer dependencies (needed by some models)
 sentencepiece>=0.2.0
 protobuf>=4.25.0
+
+# ---------------------------------------------------------------------------
+# Eval-only extras (CUDA hosts only). Skip on macOS / no-GPU environments;
+# the merge/filter/build steps work without these.
+# ---------------------------------------------------------------------------
+# vLLM serves the merged SFT model so mini-SWE-agent (via LiteLLM) can talk
+# to it over an OpenAI-compatible endpoint during eval_sft.py.
+# vllm>=0.6.3
+#
+# Official SWE-bench harness for hidden_rate / visible_rate scoring.
+# swebench>=2.1.0
