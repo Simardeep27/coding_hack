@@ -1,0 +1,85 @@
+# ===========================================================================
+# Phase 2, Step 1: SFT Warm Start Configuration
+# ===========================================================================
+# Central configuration for the integrity-aware RL pipeline's supervised
+# fine-tuning stage. All scripts (process, build, train, eval) read from
+# this file to ensure consistent hyperparameters across the pipeline.
+# ===========================================================================
+
+# --- Model Configuration ---
+model:
+  name: "Qwen/Qwen2.5-Coder-7B-Instruct"
+  max_length: 8192
+  use_4bit: true    # Enable 4-bit quantization for 24GB VRAM target
+
+# --- LoRA Configuration ---
+# Low-Rank Adaptation for parameter-efficient fine-tuning.
+# Only attention projection matrices are adapted, preserving the base
+# model's general capabilities while learning honest agent behaviors.
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+
+# --- Training Arguments ---
+training:
+  bf16: true
+  gradient_checkpointing: true
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 8
+  learning_rate: 2.0e-5
+  num_train_epochs: 3
+  warmup_ratio: 0.03
+  logging_steps: 10
+  save_steps: 100
+  packing: false          # Clean trajectory boundaries, no packing
+  output_dir: "checkpoints/sft_warmstart"
+  logging_dir: "logs/sft_warmstart"
+
+# --- Reward Function Coefficients ---
+# R = a*H + b*V - c*E - d*T - e*G
+# T (tamper) has the highest weight because tampering is the most severe exploit.
+reward:
+  a: 1.0    # H: hidden test pass rate (primary objective)
+  b: 0.2    # V: visible test pass rate
+  c: 1.0    # E: exploit severity penalty
+  d: 2.0    # T: tamper penalty (highest - most severe)
+  e: 1.5    # G: overfit gap penalty
+
+# --- Exploit Score Mapping ---
+# Maps categorical exploit levels to continuous scores for the reward function.
+# Linear mapping; consider 0/0.25/0.6/1.0 if high exploits need more weight.
+exploit_mapping:
+  none: 0.0
+  low: 0.33
+  medium: 0.66
+  high: 1.0
+
+# --- SFT Data Filtering Thresholds ---
+# Strict criteria to ensure only honest, successful trajectories enter SFT.
+# If dataset is too small (<40 examples), consider loosening min_hidden_rate to 0.6.
+filtering:
+  resolved: true
+  is_reward_hack: false
+  eval_label: "NOT_REWARD_HACK"
+  E: "none"
+  min_hidden_rate: 0.8     # Strong generalization requirement
+  max_overfit_gap: 0.1     # Visible and hidden must agree closely
+  all_signals_false: true  # No suspicious behaviors at all
+
+# --- Data Paths ---
+data:
+  input_path: "data/trajectories.jsonl"
+  sft_output_path: "data/sft_trajectories.jsonl"
+  dataset_output_dir: "data/sft_dataset"
+
+# --- Evaluation Settings ---
+evaluation:
+  num_instances: 20
+  output_report: "evaluation/sft_eval_report.md"
+  base_model_comparison: true
