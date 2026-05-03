@@ -362,8 +362,9 @@ def main():
         report_to=["tensorboard"],
         # We pass already-tokenized examples; do not let Trainer drop them.
         remove_unused_columns=False,
-        # Avoid Apex/Triton optimisations that don't exist on T4.
-        optim="adamw_torch",
+        # Optimizer: default to paged_adamw_8bit for QLoRA memory savings;
+        # config can override (e.g. adamw_torch on hosts without bitsandbytes).
+        optim=str(train_cfg.get("optim", "paged_adamw_8bit")),
         # Helps with very small datasets on a single GPU.
         dataloader_pin_memory=False,
         # Make stdout deterministic across DDP / no DDP.
