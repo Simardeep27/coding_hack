@@ -145,7 +145,7 @@ def setup_model_and_tokenizer(config: dict) -> tuple:
 
     model_kwargs: dict = {
         "trust_remote_code": True,
-        "torch_dtype": compute_dtype,
+        "dtype": compute_dtype,
     }
 
     if use_4bit:
@@ -160,6 +160,22 @@ def setup_model_and_tokenizer(config: dict) -> tuple:
             f"[INFO] NF4 + double-quant; compute_dtype="
             f"{'bfloat16' if bf16_supported else 'float16'}"
         )
+
+    # --- Multi-GPU placement -------------------------------------------------
+    # bnb 4-bit weights are pinned to a specific CUDA device. PyTorch
+    # DataParallel (which Trainer auto-wraps when it sees >1 GPU) replicates
+    # the model to other devices and crashes with "illegal memory access" on
+    # quantized layers. Force model-parallel via accelerate's device_map="auto"
+    # whenever multiple CUDA devices are visible: layers are sharded across
+    # GPUs, the Trainer detects model.hf_device_map and skips DataParallel.
+    n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    if n_gpus > 1:
+        model_kwargs["device_map"] = "auto"
+        print(f"[INFO] {n_gpus} GPUs visible -> using device_map='auto' (model parallel)")
+    elif n_gpus == 1:
+        # Single GPU: explicit placement avoids accidental CPU offload.
+        model_kwargs["device_map"] = {"": 0}
+        print("[INFO] 1 GPU visible -> placing model on cuda:0")
 
     model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
 
