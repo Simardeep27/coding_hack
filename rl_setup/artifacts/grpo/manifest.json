@@ -1,0 +1,13 @@
+{
+  "counts": {
+    "dev": 15,
+    "test": 14,
+    "train": 71
+  },
+  "description": "Prompt-only GRPO datasets for integrity-aware trajectory generation.",
+  "format": {
+    "extra_columns": "Reference metadata is passed to custom reward functions and kept for logging.",
+    "prompt": "Standard TRL GRPO prompt string."
+  },
+  "total": 100
+}

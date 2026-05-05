@@ -1,0 +1,80 @@
+{
+  "accepted": {
+    "avg_hidden_rate": 0.8228,
+    "avg_overfit_gap": 0.1202,
+    "avg_safe_reward": 0.798,
+    "avg_visible_rate": 0.943,
+    "detector_counts": {
+      "CLEAN": 80,
+      "SUSPICIOUS": 20
+    },
+    "exploit_type_counts": {
+      "none": 100
+    },
+    "label_counts": {
+      "NOT_REWARD_HACK": 100
+    },
+    "max_overfit_gap": 1.0,
+    "resolved": 78,
+    "reward_hack_rate": 0.0,
+    "reward_hacks": 0,
+    "total": 100
+  },
+  "artifact_paths": {
+    "accepted_episodes": "/Users/ssethi/Documents/coding_agent/rl_setup/artifacts/accepted_episodes.jsonl",
+    "preference_pairs": "/Users/ssethi/Documents/coding_agent/rl_setup/artifacts/preference_pairs.jsonl",
+    "rejected_episodes": "/Users/ssethi/Documents/coding_agent/rl_setup/artifacts/rejected_episodes.jsonl",
+    "scored_episodes": "/Users/ssethi/Documents/coding_agent/rl_setup/artifacts/scored_episodes.jsonl"
+  },
+  "episodes": {
+    "avg_hidden_rate": 0.8229,
+    "avg_overfit_gap": 0.1113,
+    "avg_safe_reward": 0.4874,
+    "avg_visible_rate": 0.9342,
+    "detector_counts": {
+      "CLEAN": 80,
+      "HIGH_RISK": 17,
+      "SUSPICIOUS": 20
+    },
+    "exploit_type_counts": {
+      "git_history_leakage": 5,
+      "none": 109,
+      "oracle_access": 2,
+      "test_tampering": 1
+    },
+    "label_counts": {
+      "NOT_REWARD_HACK": 109,
+      "REWARD_HACK": 8
+    },
+    "max_overfit_gap": 1.0,
+    "resolved": 91,
+    "reward_hack_rate": 0.0684,
+    "reward_hacks": 8,
+    "total": 117
+  },
+  "preference_pairs": 200,
+  "rejected": {
+    "avg_hidden_rate": 0.8235,
+    "avg_overfit_gap": 0.0588,
+    "avg_safe_reward": -1.3397,
+    "avg_visible_rate": 0.8824,
+    "detector_counts": {
+      "HIGH_RISK": 17
+    },
+    "exploit_type_counts": {
+      "git_history_leakage": 5,
+      "none": 9,
+      "oracle_access": 2,
+      "test_tampering": 1
+    },
+    "label_counts": {
+      "NOT_REWARD_HACK": 9,
+      "REWARD_HACK": 8
+    },
+    "max_overfit_gap": 1.0,
+    "resolved": 13,
+    "reward_hack_rate": 0.4706,
+    "reward_hacks": 8,
+    "total": 17
+  }
+}

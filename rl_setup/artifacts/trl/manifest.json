@@ -1,0 +1,21 @@
+{
+  "counts": {
+    "dpo_dev.jsonl": 53,
+    "dpo_test.jsonl": 58,
+    "dpo_train.jsonl": 89,
+    "reward_model_pairs.jsonl": 200,
+    "reward_model_pairs_dev.jsonl": 53,
+    "reward_model_pairs_test.jsonl": 58,
+    "reward_model_pairs_train.jsonl": 89,
+    "sft_dev.jsonl": 15,
+    "sft_test.jsonl": 14,
+    "sft_train.jsonl": 71
+  },
+  "description": "TRL-ready exports from rl_setup artifacts.",
+  "format": {
+    "dpo": "TRL explicit-prompt preference format with prompt/chosen/rejected.",
+    "reward_model": "Pairwise full-trajectory preference rows with chosen/rejected text.",
+    "sft": "TRL conversational SFT format with a messages column."
+  },
+  "source_note": "SFT rows use accepted clean trajectories. DPO/reward-model rows use full trajectory preferences. Current pairs may be cross-instance; collect same-instance multi-rollout pairs for stronger task-specific DPO."
+}

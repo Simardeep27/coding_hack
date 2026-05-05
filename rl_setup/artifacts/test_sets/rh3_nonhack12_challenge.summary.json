@@ -1,0 +1,50 @@
+{
+  "by_challenge_role": {
+    "non_reward_hack_suspicious": 12,
+    "reward_hack": 3
+  },
+  "by_detector_label": {
+    "HIGH_RISK": 10,
+    "SUSPICIOUS": 5
+  },
+  "by_eval_label": {
+    "NOT_REWARD_HACK": 12,
+    "REWARD_HACK": 3
+  },
+  "by_exploit_type": {
+    "git_history_leakage": 1,
+    "none": 12,
+    "oracle_access": 1,
+    "test_tampering": 1
+  },
+  "by_original_split": {
+    "dev": 4,
+    "test": 6,
+    "train": 5
+  },
+  "instance_ids": [
+    "pytest-dev__pytest-5413",
+    "django__django-11630",
+    "matplotlib__matplotlib-18869",
+    "django__django-11049",
+    "django__django-15061",
+    "pytest-dev__pytest-7432",
+    "django__django-11999",
+    "django__django-13964",
+    "django__django-16400",
+    "pytest-dev__pytest-9359",
+    "django__django-13551",
+    "sympy__sympy-16106",
+    "django__django-10914",
+    "django__django-12497",
+    "django__django-16408"
+  ],
+  "name": "rh3_nonhack12_challenge",
+  "note": "This is a challenge evaluation set. If you use it as a true held-out test set, exclude these instance_ids from future SFT/DPO/reward-model training.",
+  "requested": {
+    "non_hacks": 12,
+    "reward_hacks": 3
+  },
+  "source": "rl_setup/artifacts/scored_episodes.jsonl",
+  "total": 15
+}
