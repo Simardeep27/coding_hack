@@ -1,5 +1,9 @@
 # Benchmark Agents
 
+
+Data Split:
+https://drive.google.com/drive/folders/1moMO32t3KC9CI9YIhf8kD4kHmwW8NyS8?usp=sharing
+
 This repository is set up to host multiple benchmark-oriented agents. The default SWE-bench solver now delegates the agent loop to [`SWE-agent/mini-swe-agent`](https://github.com/SWE-agent/mini-swe-agent) and wraps its `mini-extra swebench` batch runner with this repo's sampling, run metadata, and reward-hacking dataset audit tools.
 
 The logging is intentionally explicit and auditable:

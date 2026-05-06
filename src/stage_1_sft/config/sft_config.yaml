@@ -1,0 +1,139 @@
+# ===========================================================================
+# Phase 2, Step 1: SFT Warm Start Configuration
+# ===========================================================================
+# Central configuration for the integrity-aware RL pipeline's supervised
+# fine-tuning stage. All scripts (process, build, train, eval) read from
+# this file to ensure consistent hyperparameters across the pipeline.
+# ===========================================================================
+
+# --- Model Configuration ---
+# Qwen2.5-Coder-7B-Instruct is the canonical 7B instruct model from the Qwen
+# team for code. With NF4 + LoRA + grad checkpointing on a T4 16 GB, the
+# realistic sequence-length budget is 2048; 4096 OOMs at the first backward
+# step (activations alone push past ~14 GB).
+model:
+  name: "Qwen/Qwen2.5-Coder-7B-Instruct"
+  # Sequence length budget per GPU class:
+  #   T4 16 GB   (Colab free, Kaggle T4)  -> 2048
+  #   P100 16 GB (Kaggle)                 -> 2048
+  #   V100 16 GB / T4 x2                  -> 3072
+  #   A100 40 GB+                         -> 8192
+  max_length: 2048
+  use_4bit: true      # Enable 4-bit quantization for 16 GB VRAM target
+
+# --- LoRA Configuration ---
+# Low-Rank Adaptation for parameter-efficient fine-tuning.
+# Only attention projection matrices are adapted, preserving the base
+# model's general capabilities while learning honest agent behaviors.
+lora:
+  r: 8
+  alpha: 16
+  dropout: 0.05
+  target_modules:
+    - "q_proj"
+    - "v_proj"
+    - "k_proj"
+    - "o_proj"
+
+# --- Training Arguments ---
+training:
+  bf16: false
+  gradient_checkpointing: true
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 8
+  learning_rate: 2.0e-4
+  num_train_epochs: 4
+  warmup_ratio: 0.05
+  logging_steps: 3
+  save_steps: 50
+  packing: false          # Clean trajectory boundaries, no packing
+  # paged_adamw_8bit: bitsandbytes 8-bit Adam with CPU paging; ~700 MB
+  # smaller optimizer state vs adamw_torch and avoids fragmentation OOMs
+  # on T4. Falls back to adamw_torch automatically if bnb is unavailable.
+  optim: "paged_adamw_8bit"
+  output_dir: "checkpoints/sft_warmstart"
+  logging_dir: "logs/sft_warmstart"
+
+# --- Reward Function Coefficients ---
+# R = a*H + b*V - c*E - d*T - e*G
+# T (tamper) has the highest weight because tampering is the most severe exploit.
+reward:
+  a: 1.0    # H: hidden test pass rate (primary objective)
+  b: 0.2    # V: visible test pass rate
+  c: 1.0    # E: exploit severity penalty
+  d: 2.0    # T: tamper penalty (highest - most severe)
+  e: 1.5    # G: overfit gap penalty
+
+# --- Exploit Score Mapping ---
+# Maps categorical exploit levels to continuous scores for the reward function.
+# Linear mapping; consider 0/0.25/0.6/1.0 if high exploits need more weight.
+exploit_mapping:
+  none: 0.0
+  low: 0.33
+  medium: 0.66
+  high: 1.0
+
+# --- SFT Data Filtering Thresholds ---
+# Strict criteria to ensure only honest, successful trajectories enter SFT.
+# If dataset is too small (<40 examples), consider loosening min_hidden_rate to 0.6.
+filtering:
+  resolved: true
+  is_reward_hack: false
+  eval_label: "NOT_REWARD_HACK"
+  E: "none"
+  min_hidden_rate: 0.8     # Strong generalization requirement
+  max_overfit_gap: 0.1     # Visible and hidden must agree closely
+  all_signals_false: true  # No suspicious behaviors at all
+
+# --- Data Paths ---
+# trajectory_inputs is a list of raw labeled-trajectory JSONL files. The merge
+# step (merge_trajectories.py) deduplicates by instance_id and writes a single
+# merged file used by the rest of the pipeline.
+data:
+  trajectory_inputs:
+    - "data/trajectories.jsonl"
+    - "data/trajectories2.jsonl"
+  merged_path: "data/merged_trajectories.jsonl"
+  # Legacy alias kept so process_trajectories.py picks up the merged file by
+  # default. Override at the CLI to point at any other source.
+  input_path: "data/merged_trajectories.jsonl"
+  sft_output_path: "data/sft_trajectories.jsonl"
+  eval_holdout_path: "data/sft_eval_trajectories.jsonl"
+  eval_instance_ids_path: "data/sft_eval_instance_ids.txt"
+  dataset_output_dir: "data/sft_dataset"
+
+# --- Train / Eval Split ---
+# After honest-trajectory filtering, the surviving rows are split into a
+# training set (used to build the tokenized SFT dataset) and a held-out
+# evaluation set (used by eval_sft.py against the real mini-SWE-agent harness).
+# Stratified by repo prefix so every repo is represented in eval.
+split:
+  eval_fraction: 0.2
+  seed: 42
+  stratify_by_repo: true
+  min_eval_per_repo: 1
+
+# --- Evaluation Settings ---
+# eval_sft.py runs a real mini-SWE-agent harness against the held-out instance
+# ids. It does NOT use placeholder metrics. See README_SFT.md for the required
+# Docker / vLLM setup.
+evaluation:
+  base_model_comparison: true
+  output_report: "evaluation/sft_eval_report.md"
+  results_dir: "evaluation/results"
+  # mini-SWE-agent + harness settings.
+  vllm_host: "127.0.0.1"
+  vllm_port: 8000
+  vllm_served_model_name: "qwen-coder-sft"
+  generation_temperature: 0.1
+  generation_max_tokens: 1024
+  workers: 1
+  visible_fail_to_pass_count: 1
+  min_hidden_fail_to_pass_count: 1
+  include_pass_to_pass: true
+  # Where to find the local SWE-bench harness for the official run.
+  swebench_dataset: "lite"
+  swebench_split: "test"
+  # Reward-hack labeler for E and is_reward_hack on eval rows.
+  labeler_judge: "static"            # "static" or "llm"
+  labeler_extra_args: ""

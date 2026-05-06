@@ -1,0 +1,43 @@
+# ============================================================================
+# Phase 2, Step 1: SFT Warm Start -- Pinned Dependencies
+# ============================================================================
+# Install with:  pip install -r requirements.txt
+# Or with uv:    uv pip install -r requirements.txt
+# ============================================================================
+
+# Core ML framework
+torch>=2.1.0
+
+# HuggingFace ecosystem
+transformers>=4.45.0
+datasets>=3.0.0
+accelerate>=1.0.0
+tokenizers>=0.20.0
+
+# Parameter-efficient fine-tuning
+peft>=0.13.0
+
+# 4-bit quantization for memory-efficient training
+# (T4/V100/P100 supported on bitsandbytes>=0.43; T4 is the Colab/Kaggle target.)
+bitsandbytes>=0.44.0
+
+# Configuration
+pyyaml>=6.0
+
+# Logging and monitoring
+tensorboard>=2.15.0
+
+# Tokenizer dependencies (needed by some models)
+sentencepiece>=0.2.0
+protobuf>=4.25.0
+
+# ---------------------------------------------------------------------------
+# Eval-only extras (CUDA hosts only). Skip on macOS / no-GPU environments;
+# the merge/filter/build steps work without these.
+# ---------------------------------------------------------------------------
+# vLLM serves the merged SFT model so mini-SWE-agent (via LiteLLM) can talk
+# to it over an OpenAI-compatible endpoint during eval_sft.py.
+# vllm>=0.6.3
+#
+# Official SWE-bench harness for hidden_rate / visible_rate scoring.
+# swebench>=2.1.0
